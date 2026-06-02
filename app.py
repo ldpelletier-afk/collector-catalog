@@ -815,6 +815,12 @@ class DetailPanel(tk.Frame):
         )
         self._lookup_bib_key = None  # set per-item in load_item()
 
+        # Coin catalog button — only shown for coin items
+        self._btn_coin_catalog = FlatButton(
+            self._header, "Coin Catalog", command=self._open_coin_catalog,
+            kind="default", padx=10, pady=2,
+        )
+
         # Notebook container — give it an explicit white bg so the ttk
         # client area never shows through dark.
         nb_frame = tk.Frame(self, bg=C["main"])
@@ -839,12 +845,13 @@ class DetailPanel(tk.Frame):
 
     # ── Info tab ──────────────────────────────────────────────────────────────
 
-    def _build_info_fields(self, type_fields):
+    def _build_info_fields(self, type_fields, type_id=None):
         inner = self._info_sf.inner
         for w in inner.winfo_children():
             w.destroy()
         self._field_vars.clear()
         self._first_field_widget = None   # first editable input, for focus
+        self._current_type_id = type_id   # kept for autocomplete queries
 
         inner.grid_columnconfigure(1, weight=1)
 
@@ -894,21 +901,19 @@ class DetailPanel(tk.Frame):
                     self._first_field_widget = txt
             else:
                 var = tk.StringVar()
-                opts = field.get("options") or []
-                if opts:
-                    # Editable combobox so the user can either pick or type a
-                    # value not in the preset list.
-                    widget = ttk.Combobox(
-                        inner, textvariable=var, values=opts,
-                        font=_font(11), state="normal",
-                    )
-                else:
-                    widget = tk.Entry(
-                        inner, textvariable=var,
-                        bg=C["main"], fg=C["text"], relief="flat", bd=0, font=_font(11),
-                        highlightthickness=1, highlightbackground=C["btn_border"],
-                        highlightcolor=C["sel_bg"],
-                    )
+                # Preset options from type definition
+                preset = list(field.get("options") or [])
+                # Suggestions from the user's own existing items (learned)
+                learned = (db.get_field_values(type_id, field["name"])
+                           if type_id else [])
+                # Merge: presets first, then learned values not already in presets
+                preset_lower = {o.lower() for o in preset}
+                combined = preset + [v for v in learned if v.lower() not in preset_lower]
+
+                widget = ttk.Combobox(
+                    inner, textvariable=var, values=combined,
+                    font=_font(11), state="normal",
+                )
                 widget.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=3)
                 var.trace_add("write", lambda *_: self._mark_dirty())
                 self._field_vars[field["name"]] = var
@@ -1142,7 +1147,7 @@ class DetailPanel(tk.Frame):
             return
 
         type_fields = item["type_fields"]
-        self._build_info_fields(type_fields)
+        self._build_info_fields(type_fields, type_id=item["type_id"])
 
         # Populate Info fields
         self._cite_key_var.set(item["cite_key"])
@@ -1160,6 +1165,14 @@ class DetailPanel(tk.Frame):
                 self._btn_lookup.pack(side="right", padx=(0, 4), pady=6)
         else:
             self._btn_lookup.pack_forget()
+
+        # Coin Catalog button — only for coin items
+        if bib_key == "coin":
+            if not self._btn_coin_catalog.winfo_ismapped():
+                self._btn_coin_catalog.pack(side="right", padx=(0, 4), pady=6)
+        else:
+            self._btn_coin_catalog.pack_forget()
+
         for field in type_fields:
             name = field["name"]
             val = item["fields"].get(name, "")
@@ -1196,6 +1209,7 @@ class DetailPanel(tk.Frame):
         self._lookup_bib_key = None
         self._first_field_widget = None
         self._btn_lookup.pack_forget()
+        self._btn_coin_catalog.pack_forget()
         self._field_vars.clear()
         for w in self._info_sf.inner.winfo_children():
             w.destroy()
@@ -1360,9 +1374,240 @@ class DetailPanel(tk.Frame):
         if self._dirty:
             self._save()
 
+    # ── Coin reference catalog ────────────────────────────────────────────────
+
+    def _open_coin_catalog(self):
+        if self._item_id is None:
+            return
+        dlg = CoinCatalogDialog(self, self)
+        self.wait_window(dlg)
+        if dlg.result:
+            # Fill only empty fields; ask before overwriting non-empty ones
+            filled, conflicts = 0, 0
+            for k, v in dlg.result.items():
+                if k not in self._field_vars:
+                    continue
+                cur = self._field_value(k)
+                if not cur:
+                    self._set_field_value(k, v)
+                    filled += 1
+                elif cur != v:
+                    conflicts += 1
+
+            if conflicts:
+                ow = messagebox.askyesno(
+                    "Coin Catalog",
+                    f"{filled} empty field(s) filled.\n\n"
+                    f"{conflicts} field(s) already have different values.\n"
+                    "Overwrite those too?",
+                    parent=self,
+                )
+                if ow:
+                    for k, v in dlg.result.items():
+                        if k in self._field_vars:
+                            self._set_field_value(k, v)
+
+            if filled or conflicts:
+                self._mark_dirty()
+
     @property
     def current_item_id(self):
         return self._item_id
+
+
+# ── Coin Catalog Dialog ───────────────────────────────────────────────────────
+
+class CoinCatalogDialog(tk.Toplevel):
+    """Searchable reference catalog of US and Canadian coins.
+
+    Returns ``result`` as a dict of coin-type field values, or None if
+    the user cancelled.
+    """
+
+    def __init__(self, parent, detail_panel):
+        super().__init__(parent)
+        self.title("Coin Catalog")
+        self.configure(bg=C["main"])
+        self.geometry("860x560")
+        self.resizable(True, True)
+        self.result = None
+        self._detail = detail_panel
+        self._all_entries = []
+        self._build()
+        self.transient(parent)
+        self.grab_set()
+        self._centre(parent)
+        self._load_all()
+
+    def _centre(self, parent):
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width() // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"+{px - self.winfo_width()//2}+{py - self.winfo_height()//2}")
+
+    def _build(self):
+        # ── Top bar: search + country filter ────────────────────────────────
+        bar = tk.Frame(self, bg=C["toolbar"], pady=8)
+        bar.pack(fill="x")
+        tk.Frame(bar, bg=C["border"], height=1).pack(fill="x", side="bottom")
+
+        tk.Label(bar, text="Search:", bg=C["toolbar"], fg=C["text"],
+                 font=_font(11)).pack(side="left", padx=(12, 4))
+        self._search_var = tk.StringVar()
+        self._search_var.trace_add("write", lambda *_: self._filter())
+        tk.Entry(bar, textvariable=self._search_var, font=_font(11), width=30,
+                 relief="solid", bd=1).pack(side="left", padx=(0, 16))
+
+        tk.Label(bar, text="Country:", bg=C["toolbar"], fg=C["text"],
+                 font=_font(11)).pack(side="left", padx=(0, 4))
+        self._country_var = tk.StringVar(value="All")
+        cb = ttk.Combobox(bar, textvariable=self._country_var,
+                          values=["All", "United States", "Canada"],
+                          state="readonly", width=16, font=_font(11))
+        cb.pack(side="left")
+        self._country_var.trace_add("write", lambda *_: self._filter())
+
+        self._count_lbl = tk.Label(bar, text="", bg=C["toolbar"],
+                                   fg=C["subtext"], font=_font(9))
+        self._count_lbl.pack(side="right", padx=12)
+
+        # ── Main pane: list (left) + detail (right) ──────────────────────────
+        pane = ttk.PanedWindow(self, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        list_frame = tk.Frame(pane, bg=C["main"])
+        detail_frame = tk.Frame(pane, bg=C["main"])
+        pane.add(list_frame, weight=2)
+        pane.add(detail_frame, weight=3)
+
+        # List
+        cols = ("title", "series", "years", "denomination")
+        self._tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                                  selectmode="browse", style="Items.Treeview")
+        for cid, lbl, w in [("title", "Coin", 220), ("series", "Series", 130),
+                             ("years", "Years", 80), ("denomination", "Denomination", 90)]:
+            self._tree.heading(cid, text=lbl)
+            self._tree.column(cid, width=w, minwidth=60)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<Double-1>", lambda _e: self._use_selected())
+        self._tree.tag_configure("odd",  background="#fafafa")
+        self._tree.tag_configure("even", background=C["main"])
+
+        # Detail card
+        detail_frame.grid_rowconfigure(0, weight=1)
+        detail_frame.grid_columnconfigure(0, weight=1)
+        self._detail_sf = ScrollFrame(detail_frame, bg=C["main"])
+        self._detail_sf.pack(fill="both", expand=True)
+        self._detail_inner = self._detail_sf.inner
+
+        # Footer buttons
+        foot = tk.Frame(self, bg=C["toolbar"], pady=8)
+        foot.pack(fill="x", side="bottom")
+        tk.Frame(foot, bg=C["border"], height=1).pack(fill="x", side="top")
+        FlatButton(foot, "Cancel", command=self.destroy, kind="default",
+                   padx=12).pack(side="right", padx=8)
+        FlatButton(foot, "Fill Fields", command=self._use_selected, kind="primary",
+                   padx=12).pack(side="right", padx=(0, 4))
+
+    def _load_all(self):
+        import coin_catalog as cc
+        self._all_entries = cc.CATALOG
+        self._filter()
+        # Focus search box
+        self.after(50, lambda: self.focus_set())
+
+    def _filter(self):
+        import coin_catalog as cc
+        q = self._search_var.get().strip()
+        country = self._country_var.get()
+        results = cc.search(q, country)
+        self._all_entries = results
+
+        self._tree.delete(*self._tree.get_children())
+        for i, e in enumerate(results):
+            tag = "even" if i % 2 == 0 else "odd"
+            self._tree.insert("", "end", iid=str(i),
+                              values=(e["title"], e["series"],
+                                      e["years"], e["denomination"]),
+                              tags=(tag,))
+        self._count_lbl.configure(
+            text=f"{len(results)} coin{'s' if len(results) != 1 else ''}")
+
+        # Auto-select first result
+        children = self._tree.get_children()
+        if children:
+            self._tree.selection_set(children[0])
+            self._show_detail(self._all_entries[0])
+
+    def _on_select(self, _e):
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._all_entries):
+            self._show_detail(self._all_entries[idx])
+
+    def _show_detail(self, entry):
+        for w in self._detail_inner.winfo_children():
+            w.destroy()
+
+        def row(label, value, bold=False):
+            if not value:
+                return
+            f = tk.Frame(self._detail_inner, bg=C["main"])
+            f.pack(fill="x", padx=16, pady=2)
+            tk.Label(f, text=label + ":", bg=C["main"], fg=C["subtext"],
+                     font=_font(10), anchor="w", width=14).pack(side="left")
+            tk.Label(f, text=value, bg=C["main"], fg=C["text"],
+                     font=_font(10, bold=bold), anchor="w",
+                     wraplength=340, justify="left").pack(side="left", fill="x")
+
+        tk.Label(self._detail_inner, text=entry["title"], bg=C["main"],
+                 fg=C["text"], font=_font(13, bold=True),
+                 wraplength=400, justify="left").pack(anchor="w", padx=16, pady=(14, 2))
+        tk.Label(self._detail_inner, text=f"{entry['series']}  •  {entry['country']}",
+                 bg=C["main"], fg=C["subtext"], font=_font(10)).pack(anchor="w", padx=16)
+
+        tk.Frame(self._detail_inner, bg=C["border"], height=1
+                 ).pack(fill="x", padx=16, pady=(8, 4))
+
+        row("Denomination", entry.get("denomination", ""))
+        row("Years", entry.get("years", ""))
+        row("Metal", entry.get("metal", ""))
+        row("Diameter", entry.get("diameter", ""))
+        row("Weight", entry.get("weight", ""))
+
+        kd = entry.get("key_dates") or []
+        if kd:
+            tk.Frame(self._detail_inner, bg=C["border"], height=1
+                     ).pack(fill="x", padx=16, pady=(8, 4))
+            tk.Label(self._detail_inner, text="Key Dates", bg=C["main"],
+                     fg=C["subtext"], font=_font(9, bold=True)).pack(anchor="w", padx=16)
+            for d in kd:
+                tk.Label(self._detail_inner, text=f"  {d}", bg=C["main"],
+                         fg=C["text"], font=_font(10), anchor="w").pack(anchor="w", padx=16)
+
+        notes = entry.get("notes", "")
+        if notes:
+            tk.Frame(self._detail_inner, bg=C["border"], height=1
+                     ).pack(fill="x", padx=16, pady=(8, 4))
+            tk.Label(self._detail_inner, text=notes, bg=C["main"], fg=C["subtext"],
+                     font=_font(10), wraplength=400, justify="left").pack(
+                anchor="w", padx=16, pady=(0, 8))
+
+    def _use_selected(self):
+        import coin_catalog as cc
+        sel = self._tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._all_entries):
+            self.result = cc.to_coin_fields(self._all_entries[idx])
+        self.destroy()
 
 
 # ── New Item Dialog ───────────────────────────────────────────────────────────

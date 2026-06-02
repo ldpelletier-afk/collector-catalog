@@ -543,6 +543,29 @@ def duplicate_item(item_id):
     )
 
 
+def get_field_values(type_id, field_name, limit=100):
+    """Return sorted unique non-empty values already recorded for *field_name*
+    across all items of *type_id*.  Used to populate autocomplete suggestions."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT fields_json FROM items WHERE type_id=?", (type_id,)
+    ).fetchall()
+    conn.close()
+    seen = set()
+    values = []
+    for r in rows:
+        try:
+            v = json.loads(r["fields_json"]).get(field_name, "")
+        except Exception:
+            continue
+        if v and isinstance(v, str):
+            stripped = v.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                values.append(stripped)
+    return sorted(values, key=str.casefold)[:limit]
+
+
 def get_item_count(collection_id=None, tag_id=None):
     conn = get_connection()
     sql = "SELECT COUNT(*) FROM items WHERE 1=1"
