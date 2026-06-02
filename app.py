@@ -815,9 +815,9 @@ class DetailPanel(tk.Frame):
         )
         self._lookup_bib_key = None  # set per-item in load_item()
 
-        # Coin catalog button — only shown for coin items
-        self._btn_coin_catalog = FlatButton(
-            self._header, "Coin Catalog", command=self._open_coin_catalog,
+        # Reference catalog button — shown for any type that has a catalog
+        self._btn_catalog = FlatButton(
+            self._header, "Reference Catalog", command=self._open_catalog,
             kind="default", padx=10, pady=2,
         )
 
@@ -1166,12 +1166,15 @@ class DetailPanel(tk.Frame):
         else:
             self._btn_lookup.pack_forget()
 
-        # Coin Catalog button — only for coin items
-        if bib_key == "coin":
-            if not self._btn_coin_catalog.winfo_ismapped():
-                self._btn_coin_catalog.pack(side="right", padx=(0, 4), pady=6)
+        # Reference catalog button — shown for any type that has a built-in catalog
+        import catalogs
+        if catalogs.has_catalog(bib_key):
+            label = catalogs.get_dialog_title(bib_key)
+            self._btn_catalog.configure_text(label)
+            if not self._btn_catalog.winfo_ismapped():
+                self._btn_catalog.pack(side="right", padx=(0, 4), pady=6)
         else:
-            self._btn_coin_catalog.pack_forget()
+            self._btn_catalog.pack_forget()
 
         for field in type_fields:
             name = field["name"]
@@ -1209,7 +1212,7 @@ class DetailPanel(tk.Frame):
         self._lookup_bib_key = None
         self._first_field_widget = None
         self._btn_lookup.pack_forget()
-        self._btn_coin_catalog.pack_forget()
+        self._btn_catalog.pack_forget()
         self._field_vars.clear()
         for w in self._info_sf.inner.winfo_children():
             w.destroy()
@@ -1374,70 +1377,85 @@ class DetailPanel(tk.Frame):
         if self._dirty:
             self._save()
 
-    # ── Coin reference catalog ────────────────────────────────────────────────
+    # ── Reference catalog (fill fields from built-in data) ───────────────────
 
-    def _open_coin_catalog(self):
+    def _open_catalog(self):
         if self._item_id is None:
             return
-        dlg = CoinCatalogDialog(self, self)
+        bib_key = self._lookup_bib_key
+        import catalogs
+        if not catalogs.has_catalog(bib_key):
+            return
+        dlg = CatalogDialog(self, bib_key)
         self.wait_window(dlg)
-        if dlg.result:
-            # Fill only empty fields; ask before overwriting non-empty ones
-            filled, conflicts = 0, 0
-            for k, v in dlg.result.items():
-                if k not in self._field_vars:
-                    continue
-                cur = self._field_value(k)
-                if not cur:
-                    self._set_field_value(k, v)
-                    filled += 1
-                elif cur != v:
-                    conflicts += 1
-
-            if conflicts:
-                ow = messagebox.askyesno(
-                    "Coin Catalog",
-                    f"{filled} empty field(s) filled.\n\n"
-                    f"{conflicts} field(s) already have different values.\n"
-                    "Overwrite those too?",
-                    parent=self,
-                )
-                if ow:
-                    for k, v in dlg.result.items():
-                        if k in self._field_vars:
-                            self._set_field_value(k, v)
-
-            if filled or conflicts:
-                self._mark_dirty()
+        if not dlg.result:
+            return
+        # Fill empty fields; ask before overwriting ones the user already typed
+        filled, conflicts = 0, []
+        for k, v in dlg.result.items():
+            if k not in self._field_vars:
+                continue
+            cur = self._field_value(k)
+            if not cur:
+                self._set_field_value(k, v)
+                filled += 1
+            elif cur != v:
+                conflicts.append((k, v))
+        if conflicts:
+            ow = messagebox.askyesno(
+                "Reference Catalog",
+                f"{filled} empty field(s) filled.\n\n"
+                f"{len(conflicts)} field(s) already have different values.\n"
+                "Overwrite those too?",
+                parent=self,
+            )
+            if ow:
+                for k, v in conflicts:
+                    if k in self._field_vars:
+                        self._set_field_value(k, v)
+        if filled or conflicts:
+            self._mark_dirty()
 
     @property
     def current_item_id(self):
         return self._item_id
 
 
-# ── Coin Catalog Dialog ───────────────────────────────────────────────────────
+# ── Generic Reference Catalog Dialog ─────────────────────────────────────────
 
-class CoinCatalogDialog(tk.Toplevel):
-    """Searchable reference catalog of US and Canadian coins.
+class CatalogDialog(tk.Toplevel):
+    """Searchable reference catalog for any item type that has a catalog.
 
-    Returns ``result`` as a dict of coin-type field values, or None if
-    the user cancelled.
+    Used in two modes:
+      standalone=True  — opened *before* an item is created (from _new_item).
+                         Shows "Add to Collection", "Create Blank", and "Cancel".
+      standalone=False — opened from the detail panel of an existing item to
+                         fill fields.  Shows "Fill Fields" and "Cancel".
+
+    ``result``  is set to a fields-dict when the user picks an entry.
+    ``skipped`` is True when the user chooses "Create Blank" (standalone mode).
     """
 
-    def __init__(self, parent, detail_panel):
+    def __init__(self, parent, bib_key: str, standalone: bool = False):
         super().__init__(parent)
-        self.title("Coin Catalog")
+        import catalogs as _cat
+        self._bib_key   = bib_key
+        self._standalone = standalone
+        self._catalogs  = _cat
+        self.result  = None
+        self.skipped = False
+        self._entries: list = []
+
+        self.title(_cat.get_dialog_title(bib_key))
         self.configure(bg=C["main"])
-        self.geometry("860x560")
+        self.geometry("920x580")
         self.resizable(True, True)
-        self.result = None
-        self._detail = detail_panel
-        self._all_entries = []
-        self._build()
         self.transient(parent)
         self.grab_set()
+        self._build()
         self._centre(parent)
-        self._load_all()
+        # Load after the window is drawn so the geometry is stable
+        self.after(10, self._load_all)
 
     def _centre(self, parent):
         self.update_idletasks()
@@ -1446,7 +1464,9 @@ class CoinCatalogDialog(tk.Toplevel):
         self.geometry(f"+{px - self.winfo_width()//2}+{py - self.winfo_height()//2}")
 
     def _build(self):
-        # ── Top bar: search + country filter ────────────────────────────────
+        import catalogs as _cat
+
+        # ── Top bar ──────────────────────────────────────────────────────────
         bar = tk.Frame(self, bg=C["toolbar"], pady=8)
         bar.pack(fill="x")
         tk.Frame(bar, bg=C["border"], height=1).pack(fill="x", side="bottom")
@@ -1455,158 +1475,193 @@ class CoinCatalogDialog(tk.Toplevel):
                  font=_font(11)).pack(side="left", padx=(12, 4))
         self._search_var = tk.StringVar()
         self._search_var.trace_add("write", lambda *_: self._filter())
-        tk.Entry(bar, textvariable=self._search_var, font=_font(11), width=30,
-                 relief="solid", bd=1).pack(side="left", padx=(0, 16))
+        search_entry = tk.Entry(bar, textvariable=self._search_var, font=_font(11),
+                                width=32, relief="solid", bd=1)
+        search_entry.pack(side="left", padx=(0, 16))
+        self.after(60, search_entry.focus_set)
 
-        tk.Label(bar, text="Country:", bg=C["toolbar"], fg=C["text"],
-                 font=_font(11)).pack(side="left", padx=(0, 4))
-        self._country_var = tk.StringVar(value="All")
-        cb = ttk.Combobox(bar, textvariable=self._country_var,
-                          values=["All", "United States", "Canada"],
-                          state="readonly", width=16, font=_font(11))
-        cb.pack(side="left")
-        self._country_var.trace_add("write", lambda *_: self._filter())
+        # Optional extra filter (e.g. Country for coins, Category for cameras)
+        self._filter_var = None
+        filter_field, filter_opts = _cat.get_filter_spec(self._bib_key)
+        if filter_field and filter_opts:
+            tk.Label(bar, text=filter_field.title() + ":", bg=C["toolbar"],
+                     fg=C["text"], font=_font(11)).pack(side="left", padx=(0, 4))
+            self._filter_var = tk.StringVar(value=filter_opts[0])
+            cb = ttk.Combobox(bar, textvariable=self._filter_var,
+                              values=filter_opts, state="readonly",
+                              width=16, font=_font(11))
+            cb.pack(side="left")
+            self._filter_var.trace_add("write", lambda *_: self._filter())
 
         self._count_lbl = tk.Label(bar, text="", bg=C["toolbar"],
                                    fg=C["subtext"], font=_font(9))
         self._count_lbl.pack(side="right", padx=12)
 
-        # ── Main pane: list (left) + detail (right) ──────────────────────────
+        # ── Main split: list (left) + detail card (right) ────────────────────
         pane = ttk.PanedWindow(self, orient="horizontal")
         pane.pack(fill="both", expand=True)
 
-        list_frame = tk.Frame(pane, bg=C["main"])
+        list_frame   = tk.Frame(pane, bg=C["main"])
         detail_frame = tk.Frame(pane, bg=C["main"])
-        pane.add(list_frame, weight=2)
+        pane.add(list_frame,   weight=2)
         pane.add(detail_frame, weight=3)
 
-        # List
-        cols = ("title", "series", "years", "denomination")
-        self._tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+        # Build list treeview from SEARCH_COLS
+        search_cols = _cat.get_search_cols(self._bib_key)
+        col_ids = [c[0] for c in search_cols]
+        self._tree = ttk.Treeview(list_frame, columns=col_ids, show="headings",
                                   selectmode="browse", style="Items.Treeview")
-        for cid, lbl, w in [("title", "Coin", 220), ("series", "Series", 130),
-                             ("years", "Years", 80), ("denomination", "Denomination", 90)]:
+        for cid, lbl, w in search_cols:
             self._tree.heading(cid, text=lbl)
-            self._tree.column(cid, width=w, minwidth=60)
+            self._tree.column(cid, width=w, minwidth=50,
+                               stretch=(cid == search_cols[0][0]))
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-        self._tree.bind("<<TreeviewSelect>>", self._on_select)
-        self._tree.bind("<Double-1>", lambda _e: self._use_selected())
         self._tree.tag_configure("odd",  background="#fafafa")
         self._tree.tag_configure("even", background=C["main"])
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<Double-1>",          lambda _e: self._use_selected())
+        self._tree.bind("<Return>",            lambda _e: self._use_selected())
 
         # Detail card
-        detail_frame.grid_rowconfigure(0, weight=1)
-        detail_frame.grid_columnconfigure(0, weight=1)
-        self._detail_sf = ScrollFrame(detail_frame, bg=C["main"])
+        self._detail_sf    = ScrollFrame(detail_frame, bg=C["main"])
         self._detail_sf.pack(fill="both", expand=True)
         self._detail_inner = self._detail_sf.inner
 
-        # Footer buttons
+        # ── Footer ───────────────────────────────────────────────────────────
         foot = tk.Frame(self, bg=C["toolbar"], pady=8)
         foot.pack(fill="x", side="bottom")
         tk.Frame(foot, bg=C["border"], height=1).pack(fill="x", side="top")
-        FlatButton(foot, "Cancel", command=self.destroy, kind="default",
-                   padx=12).pack(side="right", padx=8)
-        FlatButton(foot, "Fill Fields", command=self._use_selected, kind="primary",
-                   padx=12).pack(side="right", padx=(0, 4))
+
+        FlatButton(foot, "Cancel", command=self.destroy,
+                   kind="default", padx=12).pack(side="right", padx=8)
+
+        if self._standalone:
+            FlatButton(foot, "Add to Collection", command=self._use_selected,
+                       kind="primary", padx=12).pack(side="right", padx=(0, 4))
+            FlatButton(foot, "Create Blank Instead", command=self._skip,
+                       kind="default", padx=12).pack(side="left", padx=12)
+            tk.Label(foot,
+                     text="Search the built-in reference, select an entry, "
+                          "then click 'Add to Collection'.",
+                     bg=C["toolbar"], fg=C["subtext"],
+                     font=_font(9)).pack(side="left", padx=(4, 0))
+        else:
+            FlatButton(foot, "Fill Fields", command=self._use_selected,
+                       kind="primary", padx=12).pack(side="right", padx=(0, 4))
 
     def _load_all(self):
-        import coin_catalog as cc
-        self._all_entries = cc.CATALOG
         self._filter()
-        # Focus search box
-        self.after(50, lambda: self.focus_set())
 
     def _filter(self):
-        import coin_catalog as cc
-        q = self._search_var.get().strip()
-        country = self._country_var.get()
-        results = cc.search(q, country)
-        self._all_entries = results
+        import catalogs as _cat
+        q = self._search_var.get().strip() if hasattr(self, "_search_var") else ""
+        fv = self._filter_var.get() if self._filter_var else "All"
+        results = _cat.search(self._bib_key, q, fv)
+        self._entries = results
 
         self._tree.delete(*self._tree.get_children())
+        search_cols = _cat.get_search_cols(self._bib_key)
+        col_ids = [c[0] for c in search_cols]
+
         for i, e in enumerate(results):
             tag = "even" if i % 2 == 0 else "odd"
-            self._tree.insert("", "end", iid=str(i),
-                              values=(e["title"], e["series"],
-                                      e["years"], e["denomination"]),
-                              tags=(tag,))
-        self._count_lbl.configure(
-            text=f"{len(results)} coin{'s' if len(results) != 1 else ''}")
+            values = tuple(str(e.get(cid, "")) for cid in col_ids)
+            self._tree.insert("", "end", iid=str(i), values=values, tags=(tag,))
 
-        # Auto-select first result
+        n = len(results)
+        self._count_lbl.configure(text=f"{n} result{'s' if n != 1 else ''}")
+
         children = self._tree.get_children()
         if children:
             self._tree.selection_set(children[0])
-            self._show_detail(self._all_entries[0])
+            self._show_detail(self._entries[0])
 
     def _on_select(self, _e):
         sel = self._tree.selection()
-        if not sel:
-            return
-        idx = int(sel[0])
-        if 0 <= idx < len(self._all_entries):
-            self._show_detail(self._all_entries[idx])
+        if sel and self._entries:
+            idx = int(sel[0])
+            if 0 <= idx < len(self._entries):
+                self._show_detail(self._entries[idx])
 
     def _show_detail(self, entry):
-        for w in self._detail_inner.winfo_children():
+        import catalogs as _cat
+        inner = self._detail_inner
+        for w in inner.winfo_children():
             w.destroy()
 
-        def row(label, value, bold=False):
+        def row(label, value):
             if not value:
                 return
-            f = tk.Frame(self._detail_inner, bg=C["main"])
+            f = tk.Frame(inner, bg=C["main"])
             f.pack(fill="x", padx=16, pady=2)
             tk.Label(f, text=label + ":", bg=C["main"], fg=C["subtext"],
-                     font=_font(10), anchor="w", width=14).pack(side="left")
+                     font=_font(10), anchor="e", width=16).pack(side="left")
             tk.Label(f, text=value, bg=C["main"], fg=C["text"],
-                     font=_font(10, bold=bold), anchor="w",
-                     wraplength=340, justify="left").pack(side="left", fill="x")
+                     font=_font(10), anchor="w",
+                     wraplength=360, justify="left").pack(side="left", fill="x")
 
-        tk.Label(self._detail_inner, text=entry["title"], bg=C["main"],
-                 fg=C["text"], font=_font(13, bold=True),
-                 wraplength=400, justify="left").pack(anchor="w", padx=16, pady=(14, 2))
-        tk.Label(self._detail_inner, text=f"{entry['series']}  •  {entry['country']}",
-                 bg=C["main"], fg=C["subtext"], font=_font(10)).pack(anchor="w", padx=16)
+        # Title / main heading
+        title = (entry.get("title") or entry.get("name") or "")
+        tk.Label(inner, text=title, bg=C["main"], fg=C["text"],
+                 font=_font(13, bold=True),
+                 wraplength=420, justify="left").pack(
+            anchor="w", padx=16, pady=(14, 2))
 
-        tk.Frame(self._detail_inner, bg=C["border"], height=1
-                 ).pack(fill="x", padx=16, pady=(8, 4))
+        # Sub-heading line (series+country, artist, publisher, etc.)
+        sub_parts = []
+        for k in ("series", "artist", "writer", "publisher", "make", "country"):
+            v = entry.get(k, "")
+            if v and v not in title:
+                sub_parts.append(v)
+                break
+        if entry.get("country") and entry.get("country") not in sub_parts:
+            sub_parts.append(entry["country"])
+        if sub_parts:
+            tk.Label(inner, text="  •  ".join(sub_parts),
+                     bg=C["main"], fg=C["subtext"], font=_font(10)
+                     ).pack(anchor="w", padx=16)
 
-        row("Denomination", entry.get("denomination", ""))
-        row("Years", entry.get("years", ""))
-        row("Metal", entry.get("metal", ""))
-        row("Diameter", entry.get("diameter", ""))
-        row("Weight", entry.get("weight", ""))
+        tk.Frame(inner, bg=C["border"], height=1).pack(fill="x", padx=16, pady=(8, 4))
 
+        # Detail fields defined by the catalog module
+        for field_name, field_label in _cat.get_detail_fields(self._bib_key):
+            row(field_label, str(entry.get(field_name, "")))
+
+        # Key dates (coins / stamps have these)
         kd = entry.get("key_dates") or []
         if kd:
-            tk.Frame(self._detail_inner, bg=C["border"], height=1
+            tk.Frame(inner, bg=C["border"], height=1
                      ).pack(fill="x", padx=16, pady=(8, 4))
-            tk.Label(self._detail_inner, text="Key Dates", bg=C["main"],
+            tk.Label(inner, text="Key Dates / Varieties", bg=C["main"],
                      fg=C["subtext"], font=_font(9, bold=True)).pack(anchor="w", padx=16)
             for d in kd:
-                tk.Label(self._detail_inner, text=f"  {d}", bg=C["main"],
-                         fg=C["text"], font=_font(10), anchor="w").pack(anchor="w", padx=16)
+                tk.Label(inner, text=f"  {d}", bg=C["main"], fg=C["text"],
+                         font=_font(10), anchor="w").pack(anchor="w", padx=16)
 
         notes = entry.get("notes", "")
         if notes:
-            tk.Frame(self._detail_inner, bg=C["border"], height=1
+            tk.Frame(inner, bg=C["border"], height=1
                      ).pack(fill="x", padx=16, pady=(8, 4))
-            tk.Label(self._detail_inner, text=notes, bg=C["main"], fg=C["subtext"],
-                     font=_font(10), wraplength=400, justify="left").pack(
-                anchor="w", padx=16, pady=(0, 8))
+            tk.Label(inner, text=notes, bg=C["main"], fg=C["subtext"],
+                     font=_font(10), wraplength=420,
+                     justify="left").pack(anchor="w", padx=16, pady=(0, 12))
 
     def _use_selected(self):
-        import coin_catalog as cc
+        import catalogs as _cat
         sel = self._tree.selection()
-        if not sel:
+        if not sel or not self._entries:
             return
         idx = int(sel[0])
-        if 0 <= idx < len(self._all_entries):
-            self.result = cc.to_coin_fields(self._all_entries[idx])
+        if 0 <= idx < len(self._entries):
+            self.result = _cat.to_fields(self._bib_key, self._entries[idx])
+        self.destroy()
+
+    def _skip(self):
+        """User chose to create a blank item instead of using the catalog."""
+        self.skipped = True
         self.destroy()
 
 
@@ -2536,20 +2591,33 @@ class CollectorCatalogApp:
     # ── New item ──────────────────────────────────────────────────────────────
 
     def _new_item(self):
+        # Step 1: pick the item type
         dlg = NewItemDialog(self.root, self)
         self.root.wait_window(dlg)
         if not dlg.result:
             return
         type_id, bib_key = dlg.result
+
+        # Step 2: if this type has a built-in reference catalog, open it first
+        # so the user can search for their item and get the fields pre-filled.
+        import catalogs
+        prefilled = {}
+        if catalogs.has_catalog(bib_key):
+            cat_dlg = CatalogDialog(self.root, bib_key, standalone=True)
+            self.root.wait_window(cat_dlg)
+            if cat_dlg.result:
+                prefilled = cat_dlg.result          # picked an entry
+            elif not cat_dlg.skipped:
+                return                              # user cancelled entirely
+
+        # Step 3: create the item (blank or pre-filled) and open it for editing
         cid = self.sidebar.get_current_collection_id()
         coll_id = None if cid == -1 else cid
-        item_id = db.create_item(type_id, {}, collection_id=coll_id)
+        item_id = db.create_item(type_id, prefilled, collection_id=coll_id)
         if item_id:
             self._refresh()
             self.item_list.select_item(item_id)
             self.detail.load_item(item_id)
-            # Land the user in the first field, ready to type — no jump back
-            # to the top library.
             self.detail.focus_first_field()
 
     # ── Delete / duplicate ────────────────────────────────────────────────────

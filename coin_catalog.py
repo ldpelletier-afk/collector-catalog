@@ -251,13 +251,32 @@ def search(query: str, country: str = "All") -> List[Dict[str, Any]]:
 
 
 def to_coin_fields(entry: Dict[str, Any]) -> Dict[str, str]:
-    """Convert a catalog entry to a dict of field names matching the
-    ``coin`` item type in ``type_defs.py``, ready to fill the form."""
-    return {
+    """Convert a catalog entry to coin item-type fields."""
+    return {k: v for k, v in {
         "title":        entry.get("title", ""),
         "country":      entry.get("country", ""),
         "denomination": entry.get("denomination", ""),
         "metal":        entry.get("metal", ""),
         "diameter":     entry.get("diameter", ""),
         "weight":       entry.get("weight", ""),
-    }
+    }.items() if v}
+
+
+# Required by catalogs.py registry
+to_fields = to_coin_fields
+
+# Required by catalogs.py registry: column layout for the generic dialog
+SEARCH_COLS = [
+    ("title",        "Coin / Type",  230),
+    ("series",       "Series",       130),
+    ("years",        "Years",         70),
+    ("denomination", "Denomination",  90),
+]
+
+DETAIL_FIELDS = [
+    ("denomination", "Denomination"),
+    ("years",        "Years"),
+    ("metal",        "Metal"),
+    ("diameter",     "Diameter"),
+    ("weight",       "Weight"),
+]
