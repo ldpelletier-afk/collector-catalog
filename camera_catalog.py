@@ -128,6 +128,11 @@ CATALOG: List[Dict[str, Any]] = [
     {"title": "Canon FD 85mm f/1.2 L",                   "make": "Canon",          "mount": "Canon FD", "focal_length": "85mm", "max_aperture": "f/1.2", "lens_type": "Portrait",  "year": "1976-1989",       "category": "Lens", "notes": "Exotic aperture glass. Very sought for portrait rendering on adapted mirrorless."},
 ]
 
+# 1980-present film & digital bodies and lenses live in a separate data
+# module to keep this file manageable.
+from camera_catalog_expansion import EXPANSION
+CATALOG.extend(EXPANSION)
+
 
 def search(query: str, category: str = "All") -> List[Dict[str, Any]]:
     q = query.strip().lower()
