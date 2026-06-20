@@ -44,6 +44,53 @@ def _open_oriented(path):
         pass  # malformed/absent EXIF — fall back to the raw image
     return img
 
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def migrate_image_orientations():
+    """One-time pass that rewrites already-imported images upright on disk.
+
+    Newly added images are baked upright at import time, but images added
+    before that fix still carry a raw EXIF Orientation tag.  This walks the
+    images directory once (guarded by a settings flag) and re-saves any file
+    whose orientation tag isn't normal, so older imports become permanently
+    upright too — for Finder, exports, and any external viewer.
+
+    Returns the number of files rewritten.
+    """
+    if not PIL_AVAILABLE:
+        return 0
+    if db.get_setting("images_orientation_baked"):
+        return 0
+
+    rewritten = 0
+    images_dir = db.IMAGES_DIR
+    if images_dir.exists():
+        for path in images_dir.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in _IMG_EXTS:
+                continue
+            try:
+                with Image.open(path) as probe:
+                    orientation = probe.getexif().get(274)  # 274 = Orientation
+                    if orientation in (None, 1):
+                        continue  # already upright — don't re-encode
+                    fmt = probe.format
+                img = _open_oriented(path)
+                save_kwargs = {}
+                eff_fmt = (fmt or path.suffix.lstrip(".")).upper()
+                if eff_fmt in ("JPG", "JPEG"):
+                    save_kwargs = {"quality": 95, "subsampling": 0}
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                img.save(str(path), **save_kwargs)
+                rewritten += 1
+            except Exception:
+                continue  # skip unreadable/odd files; never block startup
+
+    db.set_setting("images_orientation_baked", True)
+    return rewritten
+
 # ── Palette / fonts ───────────────────────────────────────────────────────────
 
 C = {
@@ -3441,6 +3488,7 @@ class CollectorCatalogApp:
             self.root.createcommand("tk::mac::Quit", self.on_quit)
 
         db.init_db()
+        migrate_image_orientations()   # one-time: bake older imports upright
         setup_styles()
         self.root.report_callback_exception = self._on_callback_exception
 
