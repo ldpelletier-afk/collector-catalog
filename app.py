@@ -118,6 +118,7 @@ C = {
 }
 
 THUMB_SIZE = (90, 90)
+ARTWORK_THUMB_SIZE = (200, 200)   # larger previews for artwork items
 
 
 def _font(size=11, bold=False, mono=False):
@@ -947,6 +948,20 @@ class DetailPanel(tk.Frame):
         self._build_tags_tab()
         self._build_images_tab()
 
+    def _arrange_tabs(self, bib_key):
+        """Order the detail tabs for this item type.
+
+        Artwork is image-first, so its Images tab sits right after Info;
+        every other type keeps Images last (Info / Notes / Tags / Images).
+        """
+        try:
+            if bib_key == "artwork":
+                self._nb.insert(1, self._images_f, text="  Images  ")
+            else:
+                self._nb.insert("end", self._images_f, text="  Images  ")
+        except Exception:
+            pass  # never let tab juggling break loading an item
+
     # ── Info tab ──────────────────────────────────────────────────────────────
 
     def _build_info_fields(self, type_fields, type_id=None, bib_key=None):
@@ -1306,7 +1321,12 @@ class DetailPanel(tk.Frame):
         self._thumb_refs.clear()
         for w in self._img_grid.winfo_children():
             w.destroy()
-        col, max_col = 0, 3
+        # Artwork gets bigger previews (and fewer per row) since the image
+        # is the point of the item.
+        is_artwork = (self._lookup_bib_key == "artwork")
+        thumb_size = ARTWORK_THUMB_SIZE if is_artwork else THUMB_SIZE
+        max_col = 2 if is_artwork else 3
+        col = 0
         for path in self._image_paths:
             abs_path = db.DATA_DIR / path if not Path(path).is_absolute() else Path(path)
             cell = tk.Frame(self._img_grid, bg=C["main"], padx=4, pady=4)
@@ -1314,7 +1334,7 @@ class DetailPanel(tk.Frame):
             if PIL_AVAILABLE and abs_path.exists():
                 try:
                     img = _open_oriented(abs_path)
-                    img.thumbnail(THUMB_SIZE, Image.LANCZOS)
+                    img.thumbnail(thumb_size, Image.LANCZOS)
                     photo = ImageTk.PhotoImage(img)
                     self._thumb_refs.append(photo)
                     btn = tk.Button(
@@ -1431,6 +1451,7 @@ class DetailPanel(tk.Frame):
         bib_key = item.get("bib_key")
         self._lookup_bib_key = bib_key
         self._build_info_fields(type_fields, type_id=item["type_id"], bib_key=bib_key)
+        self._arrange_tabs(bib_key)
 
         # Populate Info fields
         self._cite_key_var.set(item["cite_key"])
