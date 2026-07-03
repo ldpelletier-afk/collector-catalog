@@ -93,7 +93,7 @@ def migrate_image_orientations():
 
 # ── Palette / fonts ───────────────────────────────────────────────────────────
 
-C = {
+LIGHT = {
     "sidebar":     "#e4e9ef",   # cool gray, distinct from main
     "main":        "#ffffff",
     "toolbar":     "#eef2f6",
@@ -111,11 +111,51 @@ C = {
     "btn_hover":   "#dde4ec",
     "red":         "#b91c1c",
     "red_hover":   "#991b1b",
+    "red_soft":    "#fee2e2",   # danger-button hover bg
     "primary":     "#1d4ed8",
     "primary_hov": "#1e40af",
     "section_lbl": "#64748b",
     "stripe":      "#f5f7fa",
 }
+
+DARK = {
+    "sidebar":     "#1a1f29",
+    "main":        "#0f141b",
+    "toolbar":     "#161b24",
+    "header_row":  "#232a36",
+    "border":      "#323b49",
+    "border_soft": "#2a323e",
+    "sel_bg":      "#2563eb",
+    "sel_fg":      "#ffffff",
+    "text":        "#e5e9f0",
+    "subtext":     "#94a3b8",
+    "tag_pill":    "#1e3a5f",
+    "tag_text":    "#bfdbfe",
+    "btn_bg":      "#1c2230",
+    "btn_border":  "#3a4555",
+    "btn_hover":   "#283143",
+    "red":         "#f87171",
+    "red_hover":   "#ef4444",
+    "red_soft":    "#3b1d1d",   # danger-button hover bg
+    "primary":     "#2563eb",
+    "primary_hov": "#3b82f6",
+    "section_lbl": "#64748b",
+    "stripe":      "#141a22",
+}
+
+# Active palette. Populated from the saved "theme" preference at import time
+# (before any widget — including FlatButton.KIND below — captures a color),
+# so switching themes takes effect on the next launch.
+THEMES = {"light": LIGHT, "dark": DARK}
+
+
+def current_theme():
+    """Return the saved theme name ('light' or 'dark'), defaulting to light."""
+    name = db.get_setting("theme", "light")
+    return name if name in THEMES else "light"
+
+
+C = dict(THEMES[current_theme()])
 
 THUMB_SIZE = (90, 90)
 ARTWORK_THUMB_SIZE = (200, 200)   # larger previews for artwork items
@@ -132,9 +172,26 @@ def _font(size=11, bold=False, mono=False):
     return (family, size, weight)
 
 
-def setup_styles():
+def setup_styles(root=None):
     """Force a cross-platform ttk theme and bind it to the palette.
     Without this, macOS aqua bleeds dark mode colors into ttk widgets."""
+    # Classic-tk widget defaults (Entry/Text cursor color, menus, etc.) that
+    # would otherwise fall back to black-on-dark in dark mode.
+    if root is not None:
+        opts = {
+            "*insertBackground":  C["text"],   # text-caret color
+            "*Entry.background":  C["main"],
+            "*Entry.foreground":  C["text"],
+            "*Text.background":   C["main"],
+            "*Text.foreground":   C["text"],
+            "*Menu.background":    C["toolbar"],
+            "*Menu.foreground":    C["text"],
+            "*Menu.activeBackground": C["sel_bg"],
+            "*Menu.activeForeground": C["sel_fg"],
+        }
+        for k, v in opts.items():
+            root.option_add(k, v)
+
     s = ttk.Style()
     try:
         s.theme_use("clam")
@@ -212,7 +269,7 @@ class FlatButton(tk.Frame):
         "primary": dict(bg=C["primary"], fg="#ffffff",   border=C["primary"],
                         hover=C["primary_hov"], bold=True),
         "danger":  dict(bg=C["btn_bg"],  fg=C["red"],    border=C["btn_border"],
-                        hover="#fee2e2", bold=False),
+                        hover=C["red_soft"], bold=False),
         "ghost":   dict(bg=C["toolbar"], fg=C["text"],   border=None,
                         hover=C["btn_hover"], bold=False),
     }
@@ -810,7 +867,7 @@ class ItemList(tk.Frame):
         menu.add_command(label="Duplicate",
                          command=lambda: self.app.duplicate_selected())
         menu.add_separator()
-        # Move to collection sub-menu
+        # Move / copy to collection sub-menus
         colls = db.get_collections()
         if colls:
             sub = tk.Menu(menu, tearoff=0)
@@ -822,6 +879,15 @@ class ItemList(tk.Frame):
                     command=lambda cid=c["id"]: self.app.move_to_collection(cid),
                 )
             menu.add_cascade(label="Move to Collection", menu=sub)
+            cpy = tk.Menu(menu, tearoff=0)
+            cpy.add_command(label="(No Collection)",
+                            command=lambda: self.app.copy_to_collection(None))
+            for c in colls:
+                cpy.add_command(
+                    label=c["name"],
+                    command=lambda cid=c["id"]: self.app.copy_to_collection(cid),
+                )
+            menu.add_cascade(label="Copy to Collection", menu=cpy)
         menu.add_separator()
         menu.add_command(label="Delete", command=self.app.delete_selected)
         menu.tk_popup(e.x_root, e.y_root)
@@ -951,11 +1017,12 @@ class DetailPanel(tk.Frame):
     def _arrange_tabs(self, bib_key):
         """Order the detail tabs for this item type.
 
-        Artwork is image-first, so its Images tab sits right after Info;
-        every other type keeps Images last (Info / Notes / Tags / Images).
+        Artwork and historical documents are image-first, so their Images
+        tab sits right after Info; every other type keeps Images last
+        (Info / Notes / Tags / Images).
         """
         try:
-            if bib_key == "artwork":
+            if bib_key in ("artwork", "document"):
                 self._nb.insert(1, self._images_f, text="  Images  ")
             else:
                 self._nb.insert("end", self._images_f, text="  Images  ")
@@ -1321,11 +1388,11 @@ class DetailPanel(tk.Frame):
         self._thumb_refs.clear()
         for w in self._img_grid.winfo_children():
             w.destroy()
-        # Artwork gets bigger previews (and fewer per row) since the image
-        # is the point of the item.
-        is_artwork = (self._lookup_bib_key == "artwork")
-        thumb_size = ARTWORK_THUMB_SIZE if is_artwork else THUMB_SIZE
-        max_col = 2 if is_artwork else 3
+        # Artwork and historical documents get bigger previews (and fewer
+        # per row) since the image is the point of the item.
+        is_image_first = self._lookup_bib_key in ("artwork", "document")
+        thumb_size = ARTWORK_THUMB_SIZE if is_image_first else THUMB_SIZE
+        max_col = 2 if is_image_first else 3
         col = 0
         for path in self._image_paths:
             abs_path = db.DATA_DIR / path if not Path(path).is_absolute() else Path(path)
@@ -2479,7 +2546,7 @@ class CatalogDialog(tk.Toplevel):
         self._tree.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self._tree.pack(side="left", fill="both", expand=True)
-        self._tree.tag_configure("odd",  background="#fafafa")
+        self._tree.tag_configure("odd",  background=C["stripe"])
         self._tree.tag_configure("even", background=C["main"])
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
         self._tree.bind("<Double-1>",          lambda _e: self._use_selected())
@@ -3510,7 +3577,7 @@ class CollectorCatalogApp:
 
         db.init_db()
         migrate_image_orientations()   # one-time: bake older imports upright
-        setup_styles()
+        setup_styles(self.root)
         self.root.report_callback_exception = self._on_callback_exception
 
         # Scrolling over a closed Combobox must not cycle its value; let the
@@ -3592,6 +3659,17 @@ class CollectorCatalogApp:
         em.add_separator()
         em.add_command(label="Find\t⌘F", command=self._focus_search)
 
+        # View
+        vm = tk.Menu(mb, tearoff=0)
+        mb.add_cascade(label="View", menu=vm)
+        self._theme_var = tk.StringVar(value=current_theme())
+        vm.add_radiobutton(label="Light Mode", value="light",
+                           variable=self._theme_var,
+                           command=lambda: self._set_theme("light"))
+        vm.add_radiobutton(label="Dark Mode", value="dark",
+                           variable=self._theme_var,
+                           command=lambda: self._set_theme("dark"))
+
         # Types
         tm = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="Item Types", menu=tm)
@@ -3607,6 +3685,9 @@ class CollectorCatalogApp:
             .pack(side="left", padx=(12, 4))
         FlatButton(tb, "Delete", command=self.delete_selected, kind="danger")\
             .pack(side="left", padx=4)
+        self._copy_btn = FlatButton(tb, "Copy to…",
+                                    command=self._copy_to_menu)
+        self._copy_btn.pack(side="left", padx=4)
 
         tk.Frame(tb, bg=C["border"], width=1).pack(side="left", fill="y", padx=10, pady=4)
 
@@ -3746,11 +3827,50 @@ class CollectorCatalogApp:
         ids = self.item_list.get_selected_ids()
         if not ids:
             return
-        new_id = db.duplicate_item(ids[-1])
-        if new_id:
+        new_ids = [nid for nid in (db.duplicate_item(i) for i in ids) if nid]
+        if new_ids:
             self._refresh()
-            self.item_list.select_item(new_id)
-            self.detail.load_item(new_id)
+            self.item_list.select_item(new_ids[-1])
+            self.detail.load_item(new_ids[-1])
+
+    def _copy_to_menu(self):
+        """Toolbar 'Copy to…': pick a collection to copy the selection into."""
+        ids = self.item_list.get_selected_ids()
+        if not ids:
+            self._status_var.set("Select one or more items to copy")
+            return
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="(No Collection)",
+                         command=lambda: self.copy_to_collection(None))
+        for c in db.get_collections():
+            menu.add_command(
+                label=c["name"],
+                command=lambda cid=c["id"]: self.copy_to_collection(cid),
+            )
+        btn = self._copy_btn
+        menu.tk_popup(btn.winfo_rootx(),
+                      btn.winfo_rooty() + btn.winfo_height())
+
+    def copy_to_collection(self, coll_id):
+        """Duplicate every selected item into *coll_id* (None = no collection).
+        The originals stay where they are."""
+        ids = self.item_list.get_selected_ids()
+        if not ids:
+            return
+        new_ids = [nid for nid in
+                   (db.duplicate_item(i, coll_id if coll_id else -1)
+                    for i in ids) if nid]
+        if not new_ids:
+            return
+        self._refresh()
+        noun = f"{len(new_ids)} item{'s' if len(new_ids) > 1 else ''}"
+        if coll_id:
+            coll = db.get_collection(coll_id)
+            dest = coll["name"] if coll else "collection"
+        else:
+            dest = "(No Collection)"
+        # After _refresh() so the copy message isn't clobbered by the count.
+        self._status_var.set(f"Copied {noun} to {dest}")
 
     def move_to_collection(self, coll_id):
         ids = self.item_list.get_selected_ids()
@@ -4233,3 +4353,44 @@ class CollectorCatalogApp:
     def on_quit(self):
         self.detail.save_if_dirty()
         self.root.destroy()
+
+    def _set_theme(self, name):
+        """Persist the chosen color theme. Palette colors are captured when
+        the module loads, so the change is applied by relaunching the app."""
+        if name == current_theme():
+            return
+        db.set_setting("theme", name)
+        self._theme_var.set(name)
+        label = "Dark" if name == "dark" else "Light"
+        relaunch = messagebox.askyesno(
+            "Restart Required",
+            f"{label} Mode will be applied after restarting Collector "
+            "Catalog.\n\nRestart now?",
+            parent=self.root,
+        )
+        if not relaunch:
+            return
+        self.detail.save_if_dirty()
+        try:
+            self._relaunch()
+        except Exception:
+            # If relaunch fails, just quit cleanly — the theme still applies
+            # the next time the user opens the app.
+            self.root.destroy()
+
+    def _relaunch(self):
+        """Restart the running process, transparently handling both the
+        bundled .app and a plain `python main.py` launch."""
+        self.root.destroy()
+        if getattr(sys, "frozen", False):
+            # PyInstaller bundle: relaunch the .app via macOS `open`, or the
+            # executable directly on other platforms.
+            if sys.platform == "darwin":
+                # …/Collector Catalog.app/Contents/MacOS/CollectorCatalog
+                exe = Path(sys.executable)
+                app_bundle = exe.parents[2]  # the .app directory
+                if app_bundle.suffix == ".app":
+                    os.execvp("open", ["open", "-n", str(app_bundle)])
+            os.execv(sys.executable, [sys.executable])
+        else:
+            os.execv(sys.executable, [sys.executable, *sys.argv])

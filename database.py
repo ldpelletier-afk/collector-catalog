@@ -42,6 +42,30 @@ def set_setting(key, value):
         json.dump(data, fh, indent=2)
 
 
+def get_section_layout(bib_key: str):
+    """Return a saved section layout for *bib_key*, or None if not customised.
+
+    A layout is a list of field-name strings and ``{"section": "Name"}`` dicts
+    that describes the order and grouping of fields in the Info tab.
+    """
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    return layouts.get(bib_key)
+
+
+def set_section_layout(bib_key: str, layout: list):
+    """Persist a custom section layout for *bib_key*."""
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    layouts[bib_key] = layout
+    set_setting("section_layouts", json.dumps(layouts))
+
+
+def clear_section_layout(bib_key: str):
+    """Remove any custom section layout for *bib_key* (reverts to type default)."""
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    layouts.pop(bib_key, None)
+    set_setting("section_layouts", json.dumps(layouts))
+
+
 def get_connection():
     _ensure_dirs()
     conn = sqlite3.connect(DB_PATH)
@@ -105,6 +129,38 @@ def init_db():
         """)
     conn.close()
     _seed_builtin_types()
+    _repair_cite_keys()
+
+
+def _repair_cite_keys():
+    """Rename cite keys containing non-printable / whitespace characters.
+
+    An old suffix scheme could generate keys with invisible control
+    characters (e.g. U+0085).  Those keys collide with their stripped
+    form on save and break the UNIQUE constraint, so saving the item
+    silently fails.  Rewrite them with clean unique keys.
+    """
+    bad = re.compile(r"[^\x21-\x7e]")          # anything outside printable ASCII
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, cite_key FROM items").fetchall()
+        with conn:
+            for r in rows:
+                key = r["cite_key"] or ""
+                if not bad.search(key):
+                    continue
+                base = bad.sub("", key) or "item"
+                new_key, n = base, 2
+                while conn.execute(
+                    "SELECT id FROM items WHERE cite_key=? AND id<>?",
+                    (new_key, r["id"]),
+                ).fetchone():
+                    new_key = f"{base}{n}"
+                    n += 1
+                conn.execute("UPDATE items SET cite_key=? WHERE id=?",
+                             (new_key, r["id"]))
+    finally:
+        conn.close()
 
 
 def _seed_builtin_types():
@@ -390,7 +446,8 @@ def _make_cite_key(title, creator, year, conn):
     key = base
     n = 1
     while conn.execute("SELECT id FROM items WHERE cite_key=?", (key,)).fetchone():
-        key = f"{base}{chr(96 + n)}"
+        # a..z, then numeric: base2, base3, ... (never non-printable chars)
+        key = f"{base}{chr(96 + n)}" if n <= 26 else f"{base}{n - 25}"
         n += 1
     return key
 
@@ -530,17 +587,34 @@ def delete_items(item_ids):
     conn.close()
 
 
-def duplicate_item(item_id):
+def duplicate_item(item_id, collection_id=-2):
+    """Create a full copy of an item (fields, notes, images, tags).
+
+    *collection_id* follows the update_item convention: -2 (default) keeps
+    the original's collection, -1/None files the copy under no collection,
+    any other value places the copy in that collection.
+    """
     item = get_item(item_id)
     if not item:
         return None
-    return create_item(
+    if collection_id == -2:
+        target = item["collection_id"]
+    elif collection_id == -1 or collection_id is None:
+        target = None
+    else:
+        target = collection_id
+    new_id = create_item(
         item["type_id"],
         dict(item["fields"]),
-        item["collection_id"],
+        target,
         item["notes"],
         list(item["images"]),
     )
+    if new_id:
+        tags = [t["name"] for t in get_item_tags(item_id)]
+        if tags:
+            set_item_tags(new_id, tags)
+    return new_id
 
 
 def get_field_values(type_id, field_name, limit=100):
