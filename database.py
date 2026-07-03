@@ -3,6 +3,7 @@
 import sqlite3
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -10,11 +11,43 @@ DATA_DIR = Path.home() / ".collector_catalog"
 DB_PATH = DATA_DIR / "catalog.db"
 IMAGES_DIR = DATA_DIR / "images"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+BACKUPS_DIR = DATA_DIR / "backups"
+BACKUP_KEEP = 10  # rotated daily snapshots to retain
 
 
 def _ensure_dirs():
     DATA_DIR.mkdir(exist_ok=True)
     IMAGES_DIR.mkdir(exist_ok=True)
+
+
+def backup_db():
+    """Snapshot the catalog to backups/catalog-YYYYMMDD.db (once per day),
+    pruning to the newest BACKUP_KEEP copies.  Returns the snapshot path,
+    or None when there is nothing to back up / today's snapshot exists.
+
+    Uses SQLite's online backup API rather than a file copy so the snapshot
+    is consistent even if another connection is mid-write.
+    """
+    if not DB_PATH.exists():
+        return None
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUPS_DIR / f"catalog-{datetime.now():%Y%m%d}.db"
+    if dest.exists():
+        return None
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    for old in sorted(BACKUPS_DIR.glob("catalog-*.db"))[:-BACKUP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return dest
 
 
 # ── Lightweight key/value settings (API tokens, prefs) ────────────────────────
@@ -76,6 +109,10 @@ def get_connection():
 
 def init_db():
     _ensure_dirs()
+    try:
+        backup_db()   # daily safety snapshot, taken before any migration runs
+    except Exception:
+        pass          # a failed backup must never block the app from opening
     conn = get_connection()
     with conn:
         conn.executescript("""
@@ -130,6 +167,10 @@ def init_db():
     conn.close()
     _seed_builtin_types()
     _repair_cite_keys()
+    try:
+        cleanup_orphan_images()   # sweep folders orphaned by older versions
+    except Exception:
+        pass
 
 
 def _repair_cite_keys():
@@ -585,10 +626,81 @@ def delete_items(item_ids):
         placeholders = ",".join("?" * len(item_ids))
         conn.execute(f"DELETE FROM items WHERE id IN ({placeholders})", item_ids)
     conn.close()
+    try:
+        cleanup_orphan_images()
+    except Exception:
+        pass  # cleanup is best-effort; never fail a delete over it
+
+
+def cleanup_orphan_images():
+    """Delete images/<id>/ folders that no surviving item references.
+
+    Reference-aware rather than id-based: items copied before image files
+    were physically duplicated may still point into another item's folder,
+    and those folders must survive until the last referrer is gone.
+    Returns the number of folders removed.
+    """
+    if not IMAGES_DIR.exists():
+        return 0
+    conn = get_connection()
+    rows = conn.execute("SELECT images_json FROM items").fetchall()
+    conn.close()
+    referenced = set()
+    for r in rows:
+        try:
+            paths = json.loads(r["images_json"])
+        except Exception:
+            continue
+        for p in paths:
+            p = Path(p)
+            if p.is_absolute():
+                try:                       # legacy absolute path inside images/
+                    referenced.add(p.relative_to(IMAGES_DIR).parts[0])
+                except (ValueError, IndexError):
+                    pass
+            elif len(p.parts) >= 2 and p.parts[0] == "images":
+                referenced.add(p.parts[1])
+    removed = 0
+    for d in IMAGES_DIR.iterdir():
+        # Only touch the app's own numeric per-item folders, never anything else.
+        if d.is_dir() and d.name.isdigit() and d.name not in referenced:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _copy_item_images(images, new_id):
+    """Copy an item's image files into images/<new_id>/ and return the
+    rewritten path list.  A file that can't be found or copied keeps its
+    original path, so the copy still displays whatever the original did."""
+    new_list = []
+    dest_dir = IMAGES_DIR / str(new_id)
+    for rel in images:
+        src = Path(rel)
+        if not src.is_absolute():
+            src = DATA_DIR / rel
+        try:
+            if src.exists():
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / src.name
+                stem, suffix, n = src.stem, src.suffix, 1
+                while dest.exists():   # two sources sharing a filename
+                    dest = dest_dir / f"{stem}_{n}{suffix}"
+                    n += 1
+                shutil.copy2(src, dest)
+                new_list.append(f"images/{new_id}/{dest.name}")
+                continue
+        except OSError:
+            pass
+        new_list.append(rel)
+    return new_list
 
 
 def duplicate_item(item_id, collection_id=-2):
     """Create a full copy of an item (fields, notes, images, tags).
+
+    Image files are physically copied into the new item's folder so the
+    copy owns its images — deleting the original can't orphan it.
 
     *collection_id* follows the update_item convention: -2 (default) keeps
     the original's collection, -1/None files the copy under no collection,
@@ -608,9 +720,11 @@ def duplicate_item(item_id, collection_id=-2):
         dict(item["fields"]),
         target,
         item["notes"],
-        list(item["images"]),
+        [],
     )
     if new_id:
+        if item["images"]:
+            update_item(new_id, images=_copy_item_images(item["images"], new_id))
         tags = [t["name"] for t in get_item_tags(item_id)]
         if tags:
             set_item_tags(new_id, tags)
