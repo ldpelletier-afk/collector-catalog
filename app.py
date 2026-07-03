@@ -321,6 +321,46 @@ class FlatButton(tk.Frame):
         self.lbl.configure(text=text)
 
 
+# ── Background work helper ────────────────────────────────────────────────────
+
+def _run_async(widget, work, on_done, on_error):
+    """Run *work* (a no-arg callable doing e.g. network I/O) on a daemon
+    thread, then deliver its return value to *on_done(result)* — or a raised
+    exception to *on_error(exc)* — back on the Tk main loop.
+
+    Tk is not thread-safe (calling ``after`` from a worker thread is
+    unreliable), so the worker only feeds a queue; the main loop polls it
+    via ``widget.after``.  When *widget* is destroyed mid-flight (dialog
+    closed, app quit) its pending ``after`` is cancelled by Tk and the
+    result is silently dropped.  Read any widget state *work* needs before
+    calling this; the worker must not touch Tk objects.
+    """
+    import threading
+    import queue as _queue
+
+    q = _queue.Queue(maxsize=1)
+
+    def runner():
+        try:
+            q.put(("done", work()))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", exc))
+
+    def poll():
+        try:
+            kind, payload = q.get_nowait()
+        except _queue.Empty:
+            try:
+                widget.after(60, poll)
+            except tk.TclError:
+                pass
+            return
+        (on_done if kind == "done" else on_error)(payload)
+
+    threading.Thread(target=runner, daemon=True).start()
+    widget.after(60, poll)
+
+
 # ── Scrollable frame helper ───────────────────────────────────────────────────
 
 def _route_scroll(e):
@@ -1659,71 +1699,87 @@ class DetailPanel(tk.Frame):
         import lookups
         bib = self._lookup_bib_key
 
-        self.config(cursor="watch")
-        self.update_idletasks()
-        try:
-            if bib == "book":
-                isbn = self._field_value("isbn")
-                if not isbn:
-                    messagebox.showinfo(
-                        "ISBN Lookup",
-                        "Type an ISBN into the ISBN field first, then click Lookup.",
-                        parent=self)
-                    return
-                results = lookups.lookup_isbn(isbn)
-
-            elif bib == "vinyl":
-                results = lookups.lookup_vinyl(
-                    artist=self._field_value("artist"),
-                    title=self._field_value("title"),
-                    catalog_number=self._field_value("catalog_number"),
-                    barcode=self._field_value("upc"),
-                )
-
-            elif bib in ("music", "cd", "cassette"):
-                token = _get_discogs_token(self)
-                if not token:
-                    return
-                barcode = self._field_value("barcode") if bib == "cd" else ""
-                results = lookups.lookup_discogs(
-                    artist=self._field_value("artist"),
-                    title=self._field_value("title"),
-                    token=token,
-                )
-
-            elif bib == "videogame":
-                upc = self._field_value("upc")
-                if not upc:
-                    messagebox.showinfo(
-                        "UPC Lookup",
-                        "Type a UPC / barcode into the UPC field first.",
-                        parent=self)
-                    return
-                token = db.get_setting("pricecharting_token", "")
-                if not token:
-                    token = simpledialog.askstring(
-                        "PriceCharting API Token",
-                        "UPC lookup uses the PriceCharting API (paid plan).\n"
-                        "Paste your API token (saved for next time):",
-                        parent=self, show="•")
-                    if not token or not token.strip():
-                        return
-                    db.set_setting("pricecharting_token", token.strip())
-                    token = token.strip()
-                results = lookups.lookup_game_upc(upc, token)
-            else:
+        # Everything that needs the UI — field reads, token prompts — happens
+        # here on the main thread.  Only the network call itself (the *work*
+        # closure, built from plain values) runs on the worker.
+        if bib == "book":
+            isbn = self._field_value("isbn")
+            if not isbn:
+                messagebox.showinfo(
+                    "ISBN Lookup",
+                    "Type an ISBN into the ISBN field first, then click Lookup.",
+                    parent=self)
                 return
+            work = lambda: lookups.lookup_isbn(isbn)
 
-        except lookups.LookupError as exc:
-            messagebox.showerror("Lookup failed", str(exc), parent=self)
+        elif bib == "vinyl":
+            artist = self._field_value("artist")
+            title = self._field_value("title")
+            catno = self._field_value("catalog_number")
+            upc = self._field_value("upc")
+            work = lambda: lookups.lookup_vinyl(
+                artist=artist, title=title,
+                catalog_number=catno, barcode=upc,
+            )
+
+        elif bib in ("music", "cd", "cassette"):
+            token = _get_discogs_token(self)
+            if not token:
+                return
+            artist = self._field_value("artist")
+            title = self._field_value("title")
+            work = lambda: lookups.lookup_discogs(
+                artist=artist, title=title, token=token,
+            )
+
+        elif bib == "videogame":
+            upc = self._field_value("upc")
+            if not upc:
+                messagebox.showinfo(
+                    "UPC Lookup",
+                    "Type a UPC / barcode into the UPC field first.",
+                    parent=self)
+                return
+            token = db.get_setting("pricecharting_token", "")
+            if not token:
+                token = simpledialog.askstring(
+                    "PriceCharting API Token",
+                    "UPC lookup uses the PriceCharting API (paid plan).\n"
+                    "Paste your API token (saved for next time):",
+                    parent=self, show="•")
+                if not token or not token.strip():
+                    return
+                db.set_setting("pricecharting_token", token.strip())
+                token = token.strip()
+            work = lambda: lookups.lookup_game_upc(upc, token)
+        else:
             return
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                "Lookup failed", f"Unexpected error:\n{exc}", parent=self)
-            return
-        finally:
+
+        item_id = self._item_id
+        self.config(cursor="watch")
+        self._btn_lookup.set_enabled(False)
+
+        def finish():
             self.config(cursor="")
+            self._btn_lookup.set_enabled(True)
 
+        def done(results):
+            finish()
+            # Drop stale results if the user opened another item meanwhile.
+            if self._item_id == item_id:
+                self._apply_lookup_results(results)
+
+        def error(exc):
+            finish()
+            if isinstance(exc, lookups.LookupError):
+                messagebox.showerror("Lookup failed", str(exc), parent=self)
+            else:
+                messagebox.showerror(
+                    "Lookup failed", f"Unexpected error:\n{exc}", parent=self)
+
+        _run_async(self, work, done, error)
+
+    def _apply_lookup_results(self, results):
         if not results:
             messagebox.showinfo(
                 "Lookup", "Nothing was returned for that identifier.", parent=self)
@@ -2391,26 +2447,29 @@ class ISBNDialog(tk.Toplevel):
         import lookups
         self.config(cursor="watch")
         self._fetch_btn.set_enabled(False)
-        self.update_idletasks()
-        try:
-            fields = lookups.lookup_isbn(isbn)
-        except lookups.LookupError as exc:
-            self._set_status(f"Not found: {exc}", error=True)
-            return
-        except Exception as exc:  # noqa: BLE001
-            self._set_status(f"Error: {exc}", error=True)
-            return
-        finally:
+        self._set_status("Looking up ISBN…")
+
+        def finish():
             self.config(cursor="")
             self._fetch_btn.set_enabled(True)
 
-        if not fields:
-            self._set_status("No data returned for that ISBN.", error=True)
-            return
+        def done(fields):
+            finish()
+            if not fields:
+                self._set_status("No data returned for that ISBN.", error=True)
+                return
+            self._result_fields = fields
+            self._show_preview(fields)
+            self._add_btn.set_enabled(True)
 
-        self._result_fields = fields
-        self._show_preview(fields)
-        self._add_btn.set_enabled(True)
+        def error(exc):
+            finish()
+            if isinstance(exc, lookups.LookupError):
+                self._set_status(f"Not found: {exc}", error=True)
+            else:
+                self._set_status(f"Error: {exc}", error=True)
+
+        _run_async(self, lambda: lookups.lookup_isbn(isbn), done, error)
 
     def _set_status(self, msg, error=False):
         self._status_lbl.configure(
