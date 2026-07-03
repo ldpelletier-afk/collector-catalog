@@ -32,8 +32,11 @@ class LookupError(Exception):
     """Raised when a lookup fails or returns nothing usable."""
 
 
-def _get_json(url: str, timeout: int = 20) -> Any:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def _get_json(url: str, timeout: int = 20, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+    hdrs = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = urllib.request.Request(url, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -238,8 +241,103 @@ def lookup_game_upc(upc: str, token: str) -> Dict[str, str]:
 # ── Dispatch helper ───────────────────────────────────────────────────────────
 
 # Item types that support an auto-fill lookup, and a short button label.
+# ── Music: artist / title → fields via Discogs ────────────────────────────────
+
+def lookup_discogs(*, artist: str = "", title: str = "", token: str) -> Dict[str, str]:
+    """Look up a release via the Discogs database search API.
+
+    Requires a free Discogs Personal Access Token (create one at
+    discogs.com → Settings → Developers → Generate new token).
+    Returns a dict of ``music`` item fields for the best-matching release.
+    If the release page is reachable a second call fetches the full tracklist.
+    """
+    if not token or not token.strip():
+        raise LookupError("A Discogs Personal Access Token is required.")
+    if not artist.strip() and not title.strip():
+        raise LookupError("Enter an artist and/or album title first.")
+
+    auth = {"Authorization": f"Discogs token={token.strip()}"}
+
+    params: Dict[str, str] = {"type": "release", "per_page": "5"}
+    if artist.strip():
+        params["artist"] = artist.strip()
+    if title.strip():
+        params["release_title"] = title.strip()
+
+    search_url = ("https://api.discogs.com/database/search?"
+                  + urllib.parse.urlencode(params))
+    data = _get_json(search_url, extra_headers=auth)
+    results = data.get("results") or []
+    if not results:
+        raise LookupError("No matching release found on Discogs.")
+
+    hit = results[0]
+    out: Dict[str, str] = {}
+
+    # Search result title comes as "Artist - Album Title"
+    raw_title = hit.get("title", "")
+    if " - " in raw_title:
+        art_part, alb_part = raw_title.split(" - ", 1)
+        out["title"] = alb_part.strip()
+        if not artist.strip():
+            out["artist"] = art_part.strip()
+    elif raw_title:
+        out["title"] = raw_title
+
+    if hit.get("year"):
+        out["year"] = str(hit["year"])
+
+    genres = hit.get("genre") or []
+    styles = hit.get("style") or []
+    genre_val = ", ".join((genres + styles)[:3])
+    if genre_val:
+        out["genre"] = genre_val
+
+    labels = hit.get("label") or []
+    if labels:
+        out["label"] = labels[0]
+
+    catno = (hit.get("catno") or "").strip()
+    if catno and catno.lower() != "none":
+        out["catalog_number"] = catno
+
+    if hit.get("country"):
+        out["country"] = hit["country"]
+
+    formats = hit.get("format") or []
+    if formats:
+        out["format"] = formats[0]
+
+    # Second call: fetch full release page for tracklist
+    resource_url = hit.get("resource_url", "")
+    if resource_url:
+        try:
+            rel = _get_json(resource_url, extra_headers=auth)
+            tracks = rel.get("tracklist") or []
+            if tracks:
+                lines = []
+                for t in tracks:
+                    pos = t.get("position", "").strip()
+                    name = t.get("title", "").strip()
+                    dur = t.get("duration", "").strip()
+                    line = f"{pos}. {name}" if pos else name
+                    if dur:
+                        line += f"  ({dur})"
+                    if name:
+                        lines.append(line)
+                if lines:
+                    out["tracklist"] = "\n".join(lines)
+        except LookupError:
+            pass  # tracklist is a bonus; don't fail the whole lookup
+
+    return {k: v for k, v in out.items() if v}
+
+
 LOOKUP_CAPABLE = {
     "book":      "ISBN Lookup",
     "vinyl":     "MusicBrainz Lookup",
+    "music":     "Discogs Lookup",
+    "cd":        "Discogs Lookup",
+    "cassette":  "Discogs Lookup",
     "videogame": "UPC Lookup",
 }
