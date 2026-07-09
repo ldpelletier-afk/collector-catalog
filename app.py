@@ -157,8 +157,7 @@ def current_theme():
 
 C = dict(THEMES[current_theme()])
 
-THUMB_SIZE = (90, 90)
-ARTWORK_THUMB_SIZE = (200, 200)   # larger previews for artwork items
+THUMB_SIZE = (200, 200)   # image previews, 2 per row, for every item type
 
 
 def _font(size=11, bold=False, mono=False):
@@ -1055,17 +1054,10 @@ class DetailPanel(tk.Frame):
         self._build_images_tab()
 
     def _arrange_tabs(self, bib_key):
-        """Order the detail tabs for this item type.
-
-        Artwork and historical documents are image-first, so their Images
-        tab sits right after Info; every other type keeps Images last
-        (Info / Notes / Tags / Images).
-        """
+        """Order the detail tabs: Info / Images / Notes / Tags for every
+        item type, so the Images tab always sits right after Info."""
         try:
-            if bib_key in ("artwork", "document"):
-                self._nb.insert(1, self._images_f, text="  Images  ")
-            else:
-                self._nb.insert("end", self._images_f, text="  Images  ")
+            self._nb.insert(1, self._images_f, text="  Images  ")
         except Exception:
             pass  # never let tab juggling break loading an item
 
@@ -1428,11 +1420,8 @@ class DetailPanel(tk.Frame):
         self._thumb_refs.clear()
         for w in self._img_grid.winfo_children():
             w.destroy()
-        # Artwork and historical documents get bigger previews (and fewer
-        # per row) since the image is the point of the item.
-        is_image_first = self._lookup_bib_key in ("artwork", "document")
-        thumb_size = ARTWORK_THUMB_SIZE if is_image_first else THUMB_SIZE
-        max_col = 2 if is_image_first else 3
+        thumb_size = THUMB_SIZE
+        max_col = 2
         col = 0
         for path in self._image_paths:
             abs_path = db.DATA_DIR / path if not Path(path).is_absolute() else Path(path)
