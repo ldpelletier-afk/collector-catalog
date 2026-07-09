@@ -9,6 +9,7 @@ only and never clobber data the user already typed.
 Services used (all reachable without a paid plan unless noted):
 
     • Books   — Open Library  (https://openlibrary.org)   free, no key
+    •         — Penguin API   (https://www.penguinrandomhouse.biz/webservices/rest/)  fallback
     • Vinyl   — MusicBrainz    (https://musicbrainz.org)   free, no key
     • Games   — PriceCharting  (https://www.pricecharting.com) needs API token
 
@@ -58,8 +59,11 @@ def _clean_isbn(isbn: str) -> str:
     return re.sub(r"[^0-9Xx]", "", isbn or "").upper()
 
 
-def lookup_isbn(isbn: str) -> Dict[str, str]:
+def lookup_isbn(isbn: str, try_penguin: bool = True) -> Dict[str, str]:
     """Look up a book by ISBN-10/13 via Open Library's Books API.
+
+    Optionally tries Penguin Random House API as a fallback if Open Library
+    doesn't return a result, to provide better Penguin catalog coverage.
 
     Returns a dict of ``book`` item fields. Raises LookupError if not found.
     """
@@ -77,50 +81,139 @@ def lookup_isbn(isbn: str) -> Dict[str, str]:
     )
     data = _get_json(url)
     key = f"ISBN:{isbn}"
-    if not data or key not in data:
-        raise LookupError(f"No book found for ISBN {isbn}.")
 
-    rec = data[key]
+    # If Open Library has the book, use it as primary source
+    if data and key in data:
+        rec = data[key]
+        out: Dict[str, str] = {}
+
+        if rec.get("title"):
+            title = rec["title"]
+            if rec.get("subtitle"):
+                title = f"{title}: {rec['subtitle']}"
+            out["title"] = title
+
+        authors = rec.get("authors") or []
+        if authors:
+            out["author"] = " and ".join(a.get("name", "") for a in authors if a.get("name"))
+
+        publishers = rec.get("publishers") or []
+        if publishers:
+            out["publisher"] = ", ".join(p.get("name", "") for p in publishers if p.get("name"))
+
+        if rec.get("publish_date"):
+            m = re.search(r"\d{4}", rec["publish_date"])
+            out["year"] = m.group(0) if m else rec["publish_date"]
+
+        places = rec.get("publish_places") or []
+        if places:
+            out["address"] = places[0].get("name", "")
+
+        if rec.get("number_of_pages"):
+            out["pages"] = str(rec["number_of_pages"])
+
+        out["isbn"] = isbn
+
+        if rec.get("url"):
+            out["url"] = rec["url"]
+
+        # Subjects → genre (first one) so the field isn't left blank.
+        subjects = rec.get("subjects") or []
+        if subjects:
+            out["genre"] = subjects[0].get("name", "")
+
+        excerpts = rec.get("excerpts") or []
+        if excerpts and excerpts[0].get("text"):
+            out["abstract"] = excerpts[0]["text"]
+
+        return {k: v for k, v in out.items() if v}
+
+    # Fallback to Penguin if enabled and Open Library fails
+    if try_penguin:
+        try:
+            return lookup_penguin_isbn(isbn)
+        except LookupError:
+            pass
+
+    # Neither source found it
+    raise LookupError(f"No book found for ISBN {isbn}.")
+
+
+# ── Books: ISBN → enrichment via Penguin Random House API ────────────────────
+
+def lookup_penguin_isbn(isbn: str) -> Dict[str, str]:
+    """Look up a book by ISBN via Penguin Random House API as a fallback source.
+
+    Returns a dict of ``book`` item fields. Raises LookupError if not found.
+    Can be used to fill gaps left by Open Library or verify information.
+    """
+    isbn = _clean_isbn(isbn)
+    if len(isbn) not in (10, 13):
+        raise LookupError("Enter a valid 10- or 13-digit ISBN first.")
+
+    # Try multiple API endpoint patterns since the exact endpoint is not fully
+    # documented. Penguin's public API structure may vary.
+    endpoints = [
+        f"https://www.penguinrandomhouse.biz/webservices/rest/v2/search?q={urllib.parse.quote(f'isbn:{isbn}')}",
+        f"https://www.penguinrandomhouse.biz/webservices/rest/search?isbn={isbn}",
+        f"https://www.penguinrandomhouse.biz/webservices/rest/findByIsbn?isbn={isbn}",
+    ]
+
+    data = None
+    for url in endpoints:
+        try:
+            data = _get_json(url, timeout=10)
+            if data and ("results" in data or "result" in data or "book" in data):
+                break
+        except (LookupError, ValueError):
+            continue
+
+    if not data:
+        raise LookupError(f"No results from Penguin API for ISBN {isbn}.")
+
+    # Handle different response structures
+    result = None
+    if isinstance(data, dict):
+        if "results" in data and data["results"]:
+            result = data["results"][0] if isinstance(data["results"], list) else data["results"]
+        elif "result" in data and data["result"]:
+            result = data["result"][0] if isinstance(data["result"], list) else data["result"]
+        elif "book" in data:
+            result = data["book"]
+        else:
+            # Try direct object
+            result = data
+
+    if not result or not isinstance(result, dict):
+        raise LookupError("Penguin API returned unexpected format.")
+
     out: Dict[str, str] = {}
 
-    if rec.get("title"):
-        title = rec["title"]
-        if rec.get("subtitle"):
-            title = f"{title}: {rec['subtitle']}"
-        out["title"] = title
-
-    authors = rec.get("authors") or []
-    if authors:
-        out["author"] = " and ".join(a.get("name", "") for a in authors if a.get("name"))
-
-    publishers = rec.get("publishers") or []
-    if publishers:
-        out["publisher"] = ", ".join(p.get("name", "") for p in publishers if p.get("name"))
-
-    if rec.get("publish_date"):
-        m = re.search(r"\d{4}", rec["publish_date"])
-        out["year"] = m.group(0) if m else rec["publish_date"]
-
-    places = rec.get("publish_places") or []
-    if places:
-        out["address"] = places[0].get("name", "")
-
-    if rec.get("number_of_pages"):
-        out["pages"] = str(rec["number_of_pages"])
-
-    out["isbn"] = isbn
-
-    if rec.get("url"):
-        out["url"] = rec["url"]
-
-    # Subjects → genre (first one) so the field isn't left blank.
-    subjects = rec.get("subjects") or []
-    if subjects:
-        out["genre"] = subjects[0].get("name", "")
-
-    excerpts = rec.get("excerpts") or []
-    if excerpts and excerpts[0].get("text"):
-        out["abstract"] = excerpts[0]["text"]
+    # Map Penguin API fields to our book fields
+    # (actual field names depend on the API version)
+    if result.get("title"):
+        out["title"] = result["title"]
+    if result.get("author"):
+        out["author"] = result["author"]
+    if result.get("publisher"):
+        out["publisher"] = result["publisher"]
+    if result.get("isbn"):
+        out["isbn"] = result["isbn"]
+    if result.get("pages") or result.get("pageCount"):
+        pages = result.get("pages") or result.get("pageCount")
+        out["pages"] = str(pages)
+    if result.get("publicationDate") or result.get("publishDate"):
+        pub_date = result.get("publicationDate") or result.get("publishDate")
+        if pub_date:
+            m = re.search(r"\d{4}", str(pub_date))
+            if m:
+                out["year"] = m.group(0)
+    if result.get("description"):
+        out["abstract"] = result["description"]
+    if result.get("language"):
+        out["language"] = result["language"]
+    if result.get("series"):
+        out["series"] = result["series"]
 
     return {k: v for k, v in out.items() if v}
 
