@@ -10,8 +10,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
 import json
 import os
+import queue
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 import database as db
@@ -51,6 +53,11 @@ C = {
 }
 
 THUMB_SIZE = (90, 90)
+
+
+def _clean_isbn(raw):
+    """Strip an ISBN down to its digits (plus a trailing X check digit)."""
+    return "".join(ch for ch in (raw or "") if ch.isdigit() or ch in "Xx").upper()
 
 
 def _font(size=11, bold=False, mono=False):
@@ -1767,6 +1774,254 @@ class ImportBibDialog(tk.Toplevel):
         self.destroy()
 
 
+class IsbnEntryDialog(tk.Toplevel):
+    """Add book after book by ISBN without leaving the keyboard.
+
+    Type or scan an ISBN and press Enter: the box clears straight away and the
+    lookup runs on its own thread, so the next barcode can go in while the
+    previous one is still in flight.  Results come back through a queue and are
+    filed into the collection as they land, so a shelf can be catalogued in one
+    continuous pass instead of one dialog per book.
+    """
+
+    POLL_MS = 120
+
+    def __init__(self, parent, type_id, collection_id=None):
+        super().__init__(parent)
+        self._type_id = type_id
+        self._collection_id = collection_id
+        self.added_ids = []          # item ids created here, in order
+        self._added_isbns = set()
+        self._failed = {}            # tree row id → ISBN, for the retry-as-stub
+        self._pending = 0
+        self._token = 0
+        self._queue = queue.Queue()
+        self._closing = False
+        self._after_id = None
+
+        self.title("Add Books by ISBN")
+        self.configure(bg=C["main"])
+        self.geometry("780x480")
+        self.minsize(560, 360)
+        self.transient(parent)
+        self.grab_set()
+        self._build()
+        self._centre(parent)
+        self.protocol("WM_DELETE_WINDOW", self._done)
+        self._after_id = self.after(self.POLL_MS, self._drain)
+
+    def _centre(self, parent):
+        self.update_idletasks()
+        px = parent.winfo_rootx() + parent.winfo_width() // 2
+        py = parent.winfo_rooty() + parent.winfo_height() // 2
+        self.geometry(f"+{px - self.winfo_width()//2}+{py - self.winfo_height()//2}")
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        bar = tk.Frame(self, bg=C["toolbar"], pady=10)
+        bar.pack(fill="x")
+        tk.Frame(bar, bg=C["border"], height=1).pack(fill="x", side="bottom")
+
+        tk.Label(bar, text="ISBN:", bg=C["toolbar"], fg=C["text"],
+                 font=_font(12, bold=True)).pack(side="left", padx=(14, 6))
+
+        self._isbn_var = tk.StringVar()
+        self._entry = tk.Entry(
+            bar, textvariable=self._isbn_var, font=_font(14, mono=True),
+            width=20, relief="flat", bd=0, highlightthickness=1,
+            highlightbackground=C["btn_border"], highlightcolor=C["sel_bg"],
+        )
+        self._entry.pack(side="left", ipady=3)
+        self._entry.bind("<Return>",   lambda _e: self._submit())
+        self._entry.bind("<KP_Enter>", lambda _e: self._submit())
+        self.after(80, self._entry.focus_set)
+
+        FlatButton(bar, "Add", command=self._submit, kind="primary",
+                   padx=14).pack(side="left", padx=8)
+
+        self._skip_dupes = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            bar, text="Skip ISBNs already in the catalog",
+            variable=self._skip_dupes, bg=C["toolbar"], fg=C["subtext"],
+            activebackground=C["toolbar"], activeforeground=C["text"],
+            selectcolor=C["main"], font=_font(10), highlightthickness=0,
+        ).pack(side="left", padx=(8, 0))
+
+        tk.Label(
+            self,
+            text="Scan a barcode or type an ISBN, then press Enter — the box "
+                 "clears immediately so you can keep going while each lookup "
+                 "finishes.  Double-click a line that came back empty to file "
+                 "it with just its ISBN and fill the rest in by hand.",
+            bg=C["main"], fg=C["subtext"], font=_font(9),
+            justify="left", wraplength=740,
+        ).pack(anchor="w", padx=14, pady=(8, 6))
+
+        wrap = tk.Frame(self, bg=C["main"])
+        wrap.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+
+        cols = ("status", "isbn", "title", "author", "year")
+        self._tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                  selectmode="browse", style="Items.Treeview")
+        for cid, lbl, w, stretch in (
+            ("status", "Status", 140, False),
+            ("isbn",   "ISBN",   125, False),
+            ("title",  "Title",  300, True),
+            ("author", "Author", 170, False),
+            ("year",   "Year",    60, False),
+        ):
+            self._tree.heading(cid, text=lbl)
+            self._tree.column(cid, width=w, minwidth=40, stretch=stretch)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self._tree.tag_configure("added",   foreground="#166534")
+        self._tree.tag_configure("waiting", foreground=C["subtext"])
+        self._tree.tag_configure("failed",  foreground=C["red"])
+        self._tree.tag_configure("dupe",    foreground="#92400e")
+        self._tree.bind("<Double-1>", self._on_double_click)
+
+        foot = tk.Frame(self, bg=C["toolbar"], pady=8)
+        foot.pack(fill="x", side="bottom")
+        tk.Frame(foot, bg=C["border"], height=1).pack(fill="x", side="top")
+        self._status = tk.Label(foot, text="No books added yet.",
+                                bg=C["toolbar"], fg=C["subtext"], font=_font(10))
+        self._status.pack(side="left", padx=14)
+        FlatButton(foot, "Done", command=self._done, kind="primary",
+                   padx=16).pack(side="right", padx=12)
+
+    # ── Submit / lookup ───────────────────────────────────────────────────────
+
+    def _submit(self):
+        isbn = _clean_isbn(self._isbn_var.get())
+        if len(isbn) not in (10, 13):
+            self._flash("Enter a 10- or 13-digit ISBN.", error=True)
+            self._entry.selection_range(0, "end")
+            self._entry.focus_set()
+            return
+
+        # Clear first: the next barcode can land while this one is resolving.
+        self._isbn_var.set("")
+        self._entry.focus_set()
+
+        if self._is_duplicate(isbn):
+            self._token += 1
+            self._tree.insert(
+                "", 0, iid=f"r{self._token}",
+                values=("Already in catalog", isbn, "", "", ""), tags=("dupe",))
+            self._refresh_status()
+            return
+
+        self._token += 1
+        iid = f"r{self._token}"
+        self._tree.insert("", 0, iid=iid,
+                          values=("Looking up…", isbn, "", "", ""),
+                          tags=("waiting",))
+        self._pending += 1
+        self._refresh_status()
+        threading.Thread(target=self._worker, args=(iid, isbn),
+                         daemon=True).start()
+
+    def _worker(self, iid, isbn):
+        """Runs off the main thread; every reply goes back through the queue."""
+        import lookups
+        try:
+            self._queue.put((iid, isbn, lookups.lookup_isbn(isbn), None))
+        except Exception as exc:  # noqa: BLE001 - LookupError or anything else
+            self._queue.put((iid, isbn, None, str(exc)))
+
+    def _drain(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                iid, isbn, fields, err = self._queue.get_nowait()
+                self._pending = max(0, self._pending - 1)
+                if fields:
+                    self._file_item(iid, isbn, fields)
+                else:
+                    self._failed[iid] = isbn
+                    self._tree.item(
+                        iid, tags=("failed",),
+                        values=("Not found", isbn,
+                                err or "No match online", "", ""))
+        except queue.Empty:
+            pass
+        self._refresh_status()
+        self._after_id = self.after(self.POLL_MS, self._drain)
+
+    def _file_item(self, iid, isbn, fields):
+        fields = dict(fields)
+        fields.setdefault("isbn", isbn)
+        item_id = db.create_item(self._type_id, fields,
+                                 collection_id=self._collection_id)
+        if not item_id:
+            self._tree.item(iid, tags=("failed",),
+                            values=("Could not save", isbn, "", "", ""))
+            return
+        self.added_ids.append(item_id)
+        self._added_isbns.add(isbn)
+        self._tree.item(iid, tags=("added",), values=(
+            "Added", isbn, fields.get("title", ""),
+            fields.get("author", ""), fields.get("year", "")))
+
+    def _on_double_click(self, _e):
+        """A failed line can still be filed with just its ISBN."""
+        iid = self._tree.focus()
+        isbn = self._failed.get(iid)
+        if not isbn:
+            return
+        item_id = db.create_item(self._type_id, {"isbn": isbn},
+                                 collection_id=self._collection_id)
+        if not item_id:
+            return
+        self._failed.pop(iid, None)
+        self.added_ids.append(item_id)
+        self._added_isbns.add(isbn)
+        self._tree.item(iid, tags=("added",),
+                        values=("Added (ISBN only)", isbn, "", "", ""))
+        self._refresh_status()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _is_duplicate(self, isbn):
+        if not self._skip_dupes.get():
+            return False
+        if isbn in self._added_isbns:
+            return True
+        try:
+            for it in db.get_items(type_id=self._type_id, query=isbn):
+                if _clean_isbn((it.get("fields") or {}).get("isbn", "")) == isbn:
+                    return True
+        except Exception:  # noqa: BLE001 - a failed check must not block adding
+            pass
+        return False
+
+    def _refresh_status(self):
+        if self._closing:
+            return
+        n = len(self.added_ids)
+        text = f"{n} book{'s' if n != 1 else ''} added"
+        if self._pending:
+            text += f"   •   {self._pending} looking up…"
+        self._status.configure(text=text, fg=C["subtext"])
+
+    def _flash(self, msg, error=False):
+        self._status.configure(text=msg, fg=C["red"] if error else C["subtext"])
+        self.after(2500, self._refresh_status)
+
+    def _done(self):
+        self._closing = True
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self.destroy()
+
+
 class NewItemDialog(tk.Toplevel):
     """Pick an item type to create."""
 
@@ -1774,6 +2029,7 @@ class NewItemDialog(tk.Toplevel):
         super().__init__(parent)
         self.app = app
         self.result = None
+        self.mode = "manual"     # "manual" (blank form) or "isbn" (rapid add)
         self.title("New Item — Choose Type")
         self.configure(bg=C["main"])
         self.resizable(False, False)
@@ -1796,9 +2052,12 @@ class NewItemDialog(tk.Toplevel):
             fg=C["text"], font=_font(13, bold=True),
         ).pack(padx=24, pady=(20, 4))
         tk.Label(
-            self, text="Click a category to create a new entry.  "
+            self, text="Click a category to open a blank entry form.  "
+                       "“Book (ISBN Lookup)” files books one after another "
+                       "straight from their barcodes.  "
                        "Custom categories show a × to remove them.",
             bg=C["main"], fg=C["subtext"], font=_font(10),
+            justify="center", wraplength=520,
         ).pack(padx=24, pady=(0, 12))
 
         self._grid_holder = tk.Frame(self, bg=C["main"])
@@ -1817,34 +2076,74 @@ class NewItemDialog(tk.Toplevel):
         for w in self._grid_holder.winfo_children():
             w.destroy()
 
-        types = db.get_all_types()
+        # One cell per item type, plus the ISBN shortcut right after the Book
+        # tile so both ways of adding a book sit side by side.
+        cells = []
+        for t in db.get_all_types():
+            cells.append(lambda p, t=t: self._make_tile(p, t))
+            if (t.get("bib_key") or "").lower() == "book":
+                cells.append(
+                    lambda p, t=t: self._make_action_tile(
+                        p, "Book\n(ISBN Lookup)",
+                        lambda tid=t["id"], bib=t["bib_key"]: self._pick_isbn(tid, bib),
+                    )
+                )
+        cells.append(self._make_add_tile)
+
         cols = 4
-        for i, t in enumerate(types):
-            tile = self._make_tile(self._grid_holder, t)
+        for i, make in enumerate(cells):
+            tile = make(self._grid_holder)
             tile.grid(row=i // cols, column=i % cols, padx=6, pady=6, sticky="nsew")
 
-        # Trailing "+ New Type" tile
-        add_tile = tk.Frame(
-            self._grid_holder, bg=C["main"], width=120, height=92,
+    def _make_add_tile(self, parent):
+        """Trailing "+ New Category" tile."""
+        tile = tk.Frame(
+            parent, bg=C["main"], width=120, height=92,
             highlightthickness=2, highlightbackground=C["btn_border"],
         )
-        add_tile.grid_propagate(False)
-        add_tile.grid(row=len(types) // cols, column=len(types) % cols,
-                      padx=6, pady=6, sticky="nsew")
+        tile.grid_propagate(False)
         lbl = tk.Label(
-            add_tile, text="+\nNew Category",
+            tile, text="+\nNew Category",
             bg=C["main"], fg=C["primary"], cursor="hand2",
             font=_font(10, bold=True), justify="center",
         )
         lbl.place(relx=0.5, rely=0.5, anchor="center")
-        for w in (add_tile, lbl):
+        for w in (tile, lbl):
             w.bind("<Button-1>", lambda _e: self._new_type())
-            w.bind("<Enter>", lambda _e, t=add_tile, l=lbl:
+            w.bind("<Enter>", lambda _e, t=tile, l=lbl:
                    (t.configure(bg=C["btn_hover"], highlightbackground=C["primary"]),
                     l.configure(bg=C["btn_hover"])))
-            w.bind("<Leave>", lambda _e, t=add_tile, l=lbl:
+            w.bind("<Leave>", lambda _e, t=tile, l=lbl:
                    (t.configure(bg=C["main"], highlightbackground=C["btn_border"]),
                     l.configure(bg=C["main"])))
+        return tile
+
+    def _make_action_tile(self, parent, label, on_click):
+        """A tile that starts a flow rather than naming an item type."""
+        tile = tk.Frame(
+            parent, bg=C["toolbar"], width=120, height=92,
+            highlightthickness=1, highlightbackground=C["primary"],
+        )
+        tile.grid_propagate(False)
+        body = tk.Label(
+            tile, text=label, bg=C["toolbar"], fg=C["primary"], cursor="hand2",
+            font=_font(10, bold=True), justify="center",
+        )
+        body.place(relx=0.5, rely=0.5, anchor="center")
+
+        def _on_enter(_e):
+            tile.configure(bg=C["sel_bg"], highlightbackground=C["sel_bg"])
+            body.configure(bg=C["sel_bg"], fg=C["sel_fg"])
+
+        def _on_leave(_e):
+            tile.configure(bg=C["toolbar"], highlightbackground=C["primary"])
+            body.configure(bg=C["toolbar"], fg=C["primary"])
+
+        for w in (tile, body):
+            w.bind("<Button-1>", lambda _e: on_click())
+            w.bind("<Enter>", _on_enter)
+            w.bind("<Leave>", _on_leave)
+        return tile
 
     def _make_tile(self, parent, t):
         is_builtin = bool(t.get("is_builtin"))
@@ -1930,6 +2229,12 @@ class NewItemDialog(tk.Toplevel):
         self.app._manage_types()
 
     def _pick(self, type_id, bib_key):
+        self.mode = "manual"
+        self.result = (type_id, bib_key)
+        self.destroy()
+
+    def _pick_isbn(self, type_id, bib_key):
+        self.mode = "isbn"
         self.result = (type_id, bib_key)
         self.destroy()
 
@@ -2469,6 +2774,7 @@ class CollectorCatalogApp:
         fm = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="File", menu=fm)
         fm.add_command(label="New Item\t⌘N", command=self._new_item)
+        fm.add_command(label="Add Books by ISBN…", command=self._new_books_by_isbn)
         fm.add_command(label="New Collection", command=self._new_collection)
         fm.add_separator()
         fm.add_command(label="Import .bib…", command=self._import_bib)
@@ -2597,9 +2903,18 @@ class CollectorCatalogApp:
         if not dlg.result:
             return
         type_id, bib_key = dlg.result
+        cid = self.sidebar.get_current_collection_id()
+        coll_id = None if cid == -1 else cid
 
-        # Step 2: if this type has a built-in reference catalog, open it first
+        # Step 2: the ISBN tile skips the form entirely and opens the rapid
+        # add-by-barcode loop instead.
+        if dlg.mode == "isbn":
+            self._add_books_by_isbn(type_id, coll_id)
+            return
+
+        # Step 3: if this type has a built-in reference catalog, open it first
         # so the user can search for their item and get the fields pre-filled.
+        # Types without one (books included) go straight to the blank form.
         import catalogs
         prefilled = {}
         if catalogs.has_catalog(bib_key):
@@ -2610,15 +2925,36 @@ class CollectorCatalogApp:
             elif not cat_dlg.skipped:
                 return                              # user cancelled entirely
 
-        # Step 3: create the item (blank or pre-filled) and open it for editing
-        cid = self.sidebar.get_current_collection_id()
-        coll_id = None if cid == -1 else cid
+        # Step 4: create the item (blank or pre-filled) and open it for editing
         item_id = db.create_item(type_id, prefilled, collection_id=coll_id)
         if item_id:
             self._refresh()
             self.item_list.select_item(item_id)
             self.detail.load_item(item_id)
             self.detail.focus_first_field()
+
+    def _new_books_by_isbn(self):
+        """File → Add Books by ISBN: straight into the loop, no type picker."""
+        t = db.get_type_by_bib_key("book")
+        if not t:
+            messagebox.showinfo(
+                "Add Books by ISBN",
+                "No “Book” category exists in this catalog.",
+                parent=self.root)
+            return
+        cid = self.sidebar.get_current_collection_id()
+        self._add_books_by_isbn(t["id"], None if cid == -1 else cid)
+
+    def _add_books_by_isbn(self, type_id, coll_id):
+        """Add books back to back by ISBN, then land on the last one added."""
+        dlg = IsbnEntryDialog(self.root, type_id, coll_id)
+        self.root.wait_window(dlg)
+        if not dlg.added_ids:
+            return
+        self._refresh()
+        last = dlg.added_ids[-1]
+        self.item_list.select_item(last)
+        self.detail.load_item(last)
 
     # ── Delete / duplicate ────────────────────────────────────────────────────
 
