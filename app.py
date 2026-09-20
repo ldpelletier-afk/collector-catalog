@@ -702,6 +702,35 @@ class ItemList(tk.Frame):
                 tags=(tag,),
             )
 
+    def insert_below(self, item, after_id):
+        """Put a row for *item* directly under *after_id*, outside the sort.
+
+        A brand-new entry has no title yet, so the active sort would fling it
+        to one end of the list, away from the row it was created from.  Keeping
+        it where the user is looking means they can see what they're typing
+        into; the next refresh files it wherever the sort says it belongs.
+        """
+        self._items.append(item)
+        index = "end"
+        if after_id is not None and self.tree.exists(str(after_id)):
+            index = self.tree.index(str(after_id)) + 1
+        self.tree.insert(
+            "", index,
+            iid=str(item["id"]),
+            values=(
+                item["title"] or "(no title)",
+                item["creator"],
+                item["year"],
+                item["type_name"],
+            ),
+        )
+        self._restripe()
+
+    def _restripe(self):
+        """Re-apply the alternating row shading after an out-of-order insert."""
+        for i, iid in enumerate(self.tree.get_children()):
+            self.tree.item(iid, tags=("even" if i % 2 == 0 else "odd",))
+
     def _sort_by(self, col):
         if self._sort_col == col:
             self._sort_asc = not self._sort_asc
@@ -2759,9 +2788,11 @@ class CollectorCatalogApp:
         self.sidebar.refresh()
         self.load_items(collection_id=-1, tag_id=None)
 
-        self.root.bind("<Control-n>", lambda _e: self._new_item())
-        self.root.bind("<Control-s>", lambda _e: self.detail.save_if_dirty())
-        self.root.bind("<Control-f>", lambda _e: self._focus_search())
+        # ⌘ on macOS, Ctrl elsewhere — the menu advertises both, so bind both.
+        for mod in ("Control", "Command"):
+            self.root.bind(f"<{mod}-n>", lambda _e: self._new_item_here())
+            self.root.bind(f"<{mod}-s>", lambda _e: self.detail.save_if_dirty())
+            self.root.bind(f"<{mod}-f>", lambda _e: self._focus_search())
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -2773,7 +2804,8 @@ class CollectorCatalogApp:
         # File
         fm = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="File", menu=fm)
-        fm.add_command(label="New Item\t⌘N", command=self._new_item)
+        fm.add_command(label="New Item\t⌘N", command=self._new_item_here)
+        fm.add_command(label="New Item (Choose Category)…", command=self._new_item)
         fm.add_command(label="Add Books by ISBN…", command=self._new_books_by_isbn)
         fm.add_command(label="New Collection", command=self._new_collection)
         fm.add_separator()
@@ -2932,6 +2964,35 @@ class CollectorCatalogApp:
             self.item_list.select_item(item_id)
             self.detail.load_item(item_id)
             self.detail.focus_first_field()
+
+    def _new_item_here(self):
+        """⌘N — another entry of the same category, right under the selected one.
+
+        This is the shortcut for working down a shelf: select a book, hit ⌘N,
+        and the next blank book is waiting immediately below with the cursor
+        already in its first field.  With nothing selected there's no category
+        to carry over, so the type picker opens instead.
+        """
+        ids = self.item_list.get_selected_ids()
+        src = db.get_item(ids[-1]) if ids else None
+        if not src:
+            self._new_item()
+            return
+
+        self.detail.save_if_dirty()
+        item_id = db.create_item(src["type_id"], {},
+                                 collection_id=src["collection_id"])
+        if not item_id:
+            return
+        new_item = db.get_item(item_id)
+        if not new_item:
+            return
+
+        self.item_list.insert_below(new_item, after_id=src["id"])
+        self.item_list.select_item(item_id)
+        self.detail.load_item(item_id)
+        self.detail.focus_first_field()
+        self.sidebar.refresh()
 
     def _new_books_by_isbn(self):
         """File → Add Books by ISBN: straight into the loop, no type picker."""
