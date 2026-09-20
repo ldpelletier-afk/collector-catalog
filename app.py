@@ -812,6 +812,7 @@ class DetailPanel(tk.Frame):
         self.app = app
         self._item_id = None
         self._field_vars = {}        # field_name → StringVar / Text widget
+        self._cite_key_entry = None  # set when the Info fields are built
         self._image_paths = []
         self._thumb_refs = []        # keep PIL refs alive
         self._dirty = False
@@ -905,6 +906,7 @@ class DetailPanel(tk.Frame):
             highlightcolor=C["sel_bg"],
         )
         ck_entry.grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=3)
+        self._cite_key_entry = ck_entry   # focused when a save hits a clash
         self._cite_key_var.trace_add("write", lambda *_: self._mark_dirty())
         row += 1
 
@@ -1247,6 +1249,7 @@ class DetailPanel(tk.Frame):
         self._lbl_key.configure(text="")
         self._lookup_bib_key = None
         self._first_field_widget = None
+        self._cite_key_entry = None
         self._btn_lookup.pack_forget()
         self._btn_catalog.pack_forget()
         self._field_vars.clear()
@@ -1395,12 +1398,37 @@ class DetailPanel(tk.Frame):
 
         new_key = self._cite_key_var.get().strip()
         notes = self._notes_txt.get("1.0", "end").rstrip("\n")
-        db.update_item(
-            self._item_id,
-            fields_dict=fields_dict,
-            notes=notes,
-            cite_key=new_key or None,
-        )
+        try:
+            db.update_item(
+                self._item_id,
+                fields_dict=fields_dict,
+                notes=notes,
+                cite_key=new_key or None,
+            )
+        except db.DuplicateCiteKeyError as exc:
+            # Nothing was written.  Say so, and leave everything the user
+            # typed exactly where it is so they can fix the key and re-save.
+            other = exc.other_title or "another item"
+            messagebox.showerror(
+                "Cite key already used",
+                f"“{exc.cite_key}” is already the cite key for {other}.\n\n"
+                "Cite keys have to be unique. Change it and save again — "
+                "nothing you typed has been lost.",
+                parent=self,
+            )
+            if self._cite_key_entry is not None:
+                self._cite_key_entry.focus_set()
+                self._cite_key_entry.selection_range(0, "end")
+            return
+        except Exception as exc:  # noqa: BLE001 - never fail silently
+            messagebox.showerror(
+                "Could not save",
+                f"This entry could not be saved:\n\n{exc}\n\n"
+                "Nothing you typed has been lost — try again, or copy the "
+                "details out before closing.",
+                parent=self,
+            )
+            return
         self._dirty = False
         self._btn_save.set_enabled(False)
         self._lbl_key.configure(text=new_key)
@@ -2788,6 +2816,11 @@ class CollectorCatalogApp:
         self.sidebar.refresh()
         self.load_items(collection_id=-1, tag_id=None)
 
+        # Tk swallows exceptions raised inside callbacks: the click does
+        # nothing, the traceback goes to a console a bundled app doesn't have,
+        # and the window just looks stuck.  Surface them instead.
+        self.root.report_callback_exception = self._report_exception
+
         # ⌘ on macOS, Ctrl elsewhere — the menu advertises both, so bind both.
         for mod in ("Control", "Command"):
             self.root.bind(f"<{mod}-n>", lambda _e: self._new_item_here())
@@ -2964,6 +2997,21 @@ class CollectorCatalogApp:
             self.item_list.select_item(item_id)
             self.detail.load_item(item_id)
             self.detail.focus_first_field()
+
+    def _report_exception(self, exc_type, exc_value, exc_tb):
+        """Show what went wrong rather than leaving a dead-looking window."""
+        import traceback
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(detail, file=sys.stderr)          # still useful when run from a shell
+        try:
+            messagebox.showerror(
+                "Something went wrong",
+                f"{exc_type.__name__}: {exc_value}\n\n"
+                "The action was cancelled. Your data has not been changed.",
+                parent=self.root,
+            )
+        except Exception:  # noqa: BLE001 - reporting must never re-raise
+            pass
 
     def _new_item_here(self):
         """⌘N — another entry of the same category, right under the selected one.

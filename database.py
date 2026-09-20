@@ -376,6 +376,40 @@ def delete_collection(coll_id):
 
 # ── Items ─────────────────────────────────────────────────────────────────────
 
+class DuplicateCiteKeyError(ValueError):
+    """Raised when a cite key is already spoken for by a different item.
+
+    Cite keys are UNIQUE in the schema, so letting the UPDATE run would raise
+    sqlite3.IntegrityError from deep inside a Tk callback, where it is only
+    ever printed to a console the user of a bundled app never sees.
+    """
+
+    def __init__(self, cite_key, other_title=""):
+        self.cite_key = cite_key
+        self.other_title = other_title
+        super().__init__(f"Cite key '{cite_key}' is already used by another item.")
+
+
+def find_item_by_cite_key(cite_key, exclude_id=None):
+    """Return (id, title) of the item holding *cite_key*, or None.
+
+    *exclude_id* skips one item, so an item keeping its own key is not
+    reported as clashing with itself.
+    """
+    conn = get_connection()
+    if exclude_id is None:
+        row = conn.execute(
+            "SELECT id, title FROM items WHERE cite_key=?", (cite_key,)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, title FROM items WHERE cite_key=? AND id<>?",
+            (cite_key, exclude_id),
+        ).fetchone()
+    conn.close()
+    return (row["id"], row["title"]) if row else None
+
+
 def _make_cite_key(title, creator, year, conn):
     creator_part = ""
     if creator:
@@ -505,6 +539,9 @@ def update_item(item_id, fields_dict=None, collection_id=-2, notes=None,
         sets.append("images_json=?")
         vals.append(json.dumps(images))
     if cite_key is not None:
+        clash = find_item_by_cite_key(cite_key, exclude_id=item_id)
+        if clash:
+            raise DuplicateCiteKeyError(cite_key, clash[1])
         sets.append("cite_key=?")
         vals.append(cite_key)
     if not sets:
