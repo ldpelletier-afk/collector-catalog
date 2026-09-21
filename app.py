@@ -1389,7 +1389,11 @@ class DetailPanel(tk.Frame):
         item = db.get_item(self._item_id)
         if not item:
             return
-        fields_dict = {}
+        # Start from what's stored so fields the form doesn't render survive.
+        # A .bib can carry keys this item type has no input for (an imported
+        # book's editor or note, say); rebuilding the dict from the form alone
+        # silently threw them away the first time the item was edited.
+        fields_dict = dict(item.get("fields") or {})
         for name, widget in self._field_vars.items():
             if isinstance(widget, tk.Text):
                 fields_dict[name] = widget.get("1.0", "end").rstrip("\n")
