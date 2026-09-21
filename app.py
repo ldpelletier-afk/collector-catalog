@@ -3997,6 +3997,7 @@ class CollectorCatalogApp:
         self._current_tag = None
         self._search_query = ""
         self._fullscreen_var = tk.BooleanVar(value=False)
+        self._normal_geometry = ""   # size to restore when leaving full screen
 
         self._build_menu()
         self._build_toolbar()
@@ -4079,8 +4080,11 @@ class CollectorCatalogApp:
         # View
         vm = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="View", menu=vm)
-        accel = "⌃⌘F" if sys.platform == "darwin" else "F11"
-        vm.add_checkbutton(label=f"Full Screen\t{accel}",
+        # accelerator= is the right option here: a "\t" in the label is drawn
+        # literally by the macOS menu bar.
+        vm.add_checkbutton(label="Full Screen",
+                           accelerator=("Ctrl+Cmd+F" if sys.platform == "darwin"
+                                        else "F11"),
                            variable=self._fullscreen_var,
                            command=self._toggle_fullscreen)
         vm.add_separator()
@@ -4903,18 +4907,21 @@ class CollectorCatalogApp:
 
     def _set_fullscreen(self, on):
         on = bool(on)
+        if on and not self._normal_geometry:
+            # Remember the size to come back to, rather than guessing one.
+            self._normal_geometry = self.root.geometry()
+
         try:
             self.root.attributes("-fullscreen", on)
         except tk.TclError:
-            # A window manager without -fullscreen: maximize instead, so the
-            # menu item still does something recognisable.
-            try:
+            try:                              # Windows
                 self.root.state("zoomed" if on else "normal")
             except tk.TclError:
-                try:
+                try:                          # some X11 window managers
                     self.root.attributes("-zoomed", on)
                 except tk.TclError:
-                    return
+                    pass                      # _verify_fullscreen will cope
+
         self._fullscreen_var.set(on)
         db.set_setting("fullscreen", on)
         if on:
@@ -4923,9 +4930,28 @@ class CollectorCatalogApp:
             # Put the item count back rather than leaving the hint behind.
             n = len(self.item_list._items)
             self._status_var.set(f"{n} item{'s' if n != 1 else ''}")
-        if not on:
-            # Re-assert the normal size; some WMs leave the window borderless.
-            self.root.after_idle(lambda: self.root.geometry("1200x740"))
+
+        # Asking is not the same as getting: some Tk builds (notably on
+        # macOS) accept -fullscreen and quietly do nothing.  Check what
+        # actually happened once the window manager has had a moment, and
+        # resize by hand if the request was ignored.
+        self.root.after(300, lambda: self._verify_fullscreen(on))
+
+    def _verify_fullscreen(self, wanted):
+        if bool(self._fullscreen_var.get()) is not wanted:
+            return                    # toggled again in the meantime
+        try:
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+        except tk.TclError:
+            return
+        if wanted:
+            if w < sw * 0.9 or h < sh * 0.9:
+                self.root.geometry(f"{sw}x{sh}+0+0")
+        elif self._normal_geometry:
+            if w >= sw * 0.9 and h >= sh * 0.9:
+                self.root.geometry(self._normal_geometry)
+            self._normal_geometry = ""
 
     def _restore_fullscreen(self):
         """Re-enter full screen at launch if that's how the app was left."""
