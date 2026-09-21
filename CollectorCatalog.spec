@@ -22,6 +22,20 @@ a = Analysis(
     datas=datas,
     hiddenimports=[
         "PIL._tkinter_finder",  # ensure Pillow's tk integration ships
+        # Catalog modules loaded via importlib.import_module() — PyInstaller
+        # can't detect these automatically, so we declare them explicitly.
+        "coin_catalog",
+        "stamp_catalog",
+        "artwork_catalog",
+        "comic_catalog",
+        "vinyl_catalog",
+        "camera_catalog",
+        "type_defs",
+        "bib_io",
+        "lookups",
+        "pricecharting",
+        "database",
+        "catalogs",
     ],
     hookspath=[],
     runtime_hooks=[],

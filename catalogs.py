@@ -25,6 +25,15 @@ REGISTRY: Dict[str, Tuple[str, str, Optional[str], Optional[List[str]]]] = {
     "artwork":    ("artwork_catalog", "Artwork Reference",    None,       None),
     "comic":      ("comic_catalog",   "Comic Reference",      None,       None),
     "vinyl":      ("vinyl_catalog",   "Vinyl Reference",      None,       None),
+    "music":      ("music_catalog",   "Music Reference",      "media",    ["All", "Vinyl", "CD", "Cassette",
+                                                                            "SACD", "DVD-Audio", "Blu-ray Audio",
+                                                                            "8-Track", "Reel-to-Reel", "MiniDisc",
+                                                                            "Digital / Streaming"]),
+    "cd":         ("music_catalog",   "Music Reference",      "media",    ["All", "CD", "Vinyl", "Cassette",
+                                                                            "SACD", "DVD-Audio", "Blu-ray Audio",
+                                                                            "8-Track", "Reel-to-Reel", "MiniDisc"]),
+    "cassette":   ("music_catalog",   "Music Reference",      "media",    ["All", "Cassette", "Vinyl", "CD",
+                                                                            "8-Track", "Reel-to-Reel", "MiniDisc"]),
     "camera":     ("camera_catalog",  "Camera Reference",     "category", ["All", "Camera", "Lens"]),
     "lens":       ("camera_catalog",  "Camera / Lens Reference","category",["All", "Camera", "Lens"]),
 }
@@ -86,3 +95,18 @@ def get_detail_fields(bib_key: str) -> List[Tuple[str, str]]:
     if mod and hasattr(mod, "DETAIL_FIELDS"):
         return mod.DETAIL_FIELDS
     return []
+
+
+def get_field_values(bib_key: str, field_name: str) -> List[str]:
+    """Return sorted unique non-empty values for *field_name* across the catalog."""
+    mod = get_module(bib_key)
+    if not mod or not hasattr(mod, "CATALOG"):
+        return []
+    seen: set = set()
+    result: List[str] = []
+    for entry in mod.CATALOG:
+        v = str(entry.get(field_name, "")).strip()
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return sorted(result)

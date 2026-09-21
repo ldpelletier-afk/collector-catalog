@@ -3,6 +3,7 @@
 import sqlite3
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -10,11 +11,43 @@ DATA_DIR = Path.home() / ".collector_catalog"
 DB_PATH = DATA_DIR / "catalog.db"
 IMAGES_DIR = DATA_DIR / "images"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+BACKUPS_DIR = DATA_DIR / "backups"
+BACKUP_KEEP = 10  # rotated daily snapshots to retain
 
 
 def _ensure_dirs():
     DATA_DIR.mkdir(exist_ok=True)
     IMAGES_DIR.mkdir(exist_ok=True)
+
+
+def backup_db():
+    """Snapshot the catalog to backups/catalog-YYYYMMDD.db (once per day),
+    pruning to the newest BACKUP_KEEP copies.  Returns the snapshot path,
+    or None when there is nothing to back up / today's snapshot exists.
+
+    Uses SQLite's online backup API rather than a file copy so the snapshot
+    is consistent even if another connection is mid-write.
+    """
+    if not DB_PATH.exists():
+        return None
+    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = BACKUPS_DIR / f"catalog-{datetime.now():%Y%m%d}.db"
+    if dest.exists():
+        return None
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    for old in sorted(BACKUPS_DIR.glob("catalog-*.db"))[:-BACKUP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return dest
 
 
 # ── Lightweight key/value settings (API tokens, prefs) ────────────────────────
@@ -42,6 +75,30 @@ def set_setting(key, value):
         json.dump(data, fh, indent=2)
 
 
+def get_section_layout(bib_key: str):
+    """Return a saved section layout for *bib_key*, or None if not customised.
+
+    A layout is a list of field-name strings and ``{"section": "Name"}`` dicts
+    that describes the order and grouping of fields in the Info tab.
+    """
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    return layouts.get(bib_key)
+
+
+def set_section_layout(bib_key: str, layout: list):
+    """Persist a custom section layout for *bib_key*."""
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    layouts[bib_key] = layout
+    set_setting("section_layouts", json.dumps(layouts))
+
+
+def clear_section_layout(bib_key: str):
+    """Remove any custom section layout for *bib_key* (reverts to type default)."""
+    layouts = json.loads(get_setting("section_layouts", "{}") or "{}")
+    layouts.pop(bib_key, None)
+    set_setting("section_layouts", json.dumps(layouts))
+
+
 def get_connection():
     _ensure_dirs()
     conn = sqlite3.connect(DB_PATH)
@@ -52,6 +109,10 @@ def get_connection():
 
 def init_db():
     _ensure_dirs()
+    try:
+        backup_db()   # daily safety snapshot, taken before any migration runs
+    except Exception:
+        pass          # a failed backup must never block the app from opening
     conn = get_connection()
     with conn:
         conn.executescript("""
@@ -105,6 +166,42 @@ def init_db():
         """)
     conn.close()
     _seed_builtin_types()
+    _repair_cite_keys()
+    try:
+        cleanup_orphan_images()   # sweep folders orphaned by older versions
+    except Exception:
+        pass
+
+
+def _repair_cite_keys():
+    """Rename cite keys containing non-printable / whitespace characters.
+
+    An old suffix scheme could generate keys with invisible control
+    characters (e.g. U+0085).  Those keys collide with their stripped
+    form on save and break the UNIQUE constraint, so saving the item
+    silently fails.  Rewrite them with clean unique keys.
+    """
+    bad = re.compile(r"[^\x21-\x7e]")          # anything outside printable ASCII
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, cite_key FROM items").fetchall()
+        with conn:
+            for r in rows:
+                key = r["cite_key"] or ""
+                if not bad.search(key):
+                    continue
+                base = bad.sub("", key) or "item"
+                new_key, n = base, 2
+                while conn.execute(
+                    "SELECT id FROM items WHERE cite_key=? AND id<>?",
+                    (new_key, r["id"]),
+                ).fetchone():
+                    new_key = f"{base}{n}"
+                    n += 1
+                conn.execute("UPDATE items SET cite_key=? WHERE id=?",
+                             (new_key, r["id"]))
+    finally:
+        conn.close()
 
 
 def _seed_builtin_types():
@@ -376,40 +473,6 @@ def delete_collection(coll_id):
 
 # ── Items ─────────────────────────────────────────────────────────────────────
 
-class DuplicateCiteKeyError(ValueError):
-    """Raised when a cite key is already spoken for by a different item.
-
-    Cite keys are UNIQUE in the schema, so letting the UPDATE run would raise
-    sqlite3.IntegrityError from deep inside a Tk callback, where it is only
-    ever printed to a console the user of a bundled app never sees.
-    """
-
-    def __init__(self, cite_key, other_title=""):
-        self.cite_key = cite_key
-        self.other_title = other_title
-        super().__init__(f"Cite key '{cite_key}' is already used by another item.")
-
-
-def find_item_by_cite_key(cite_key, exclude_id=None):
-    """Return (id, title) of the item holding *cite_key*, or None.
-
-    *exclude_id* skips one item, so an item keeping its own key is not
-    reported as clashing with itself.
-    """
-    conn = get_connection()
-    if exclude_id is None:
-        row = conn.execute(
-            "SELECT id, title FROM items WHERE cite_key=?", (cite_key,)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT id, title FROM items WHERE cite_key=? AND id<>?",
-            (cite_key, exclude_id),
-        ).fetchone()
-    conn.close()
-    return (row["id"], row["title"]) if row else None
-
-
 def _make_cite_key(title, creator, year, conn):
     creator_part = ""
     if creator:
@@ -424,7 +487,8 @@ def _make_cite_key(title, creator, year, conn):
     key = base
     n = 1
     while conn.execute("SELECT id FROM items WHERE cite_key=?", (key,)).fetchone():
-        key = f"{base}{chr(96 + n)}"
+        # a..z, then numeric: base2, base3, ... (never non-printable chars)
+        key = f"{base}{chr(96 + n)}" if n <= 26 else f"{base}{n - 25}"
         n += 1
     return key
 
@@ -539,9 +603,6 @@ def update_item(item_id, fields_dict=None, collection_id=-2, notes=None,
         sets.append("images_json=?")
         vals.append(json.dumps(images))
     if cite_key is not None:
-        clash = find_item_by_cite_key(cite_key, exclude_id=item_id)
-        if clash:
-            raise DuplicateCiteKeyError(cite_key, clash[1])
         sets.append("cite_key=?")
         vals.append(cite_key)
     if not sets:
@@ -565,19 +626,109 @@ def delete_items(item_ids):
         placeholders = ",".join("?" * len(item_ids))
         conn.execute(f"DELETE FROM items WHERE id IN ({placeholders})", item_ids)
     conn.close()
+    try:
+        cleanup_orphan_images()
+    except Exception:
+        pass  # cleanup is best-effort; never fail a delete over it
 
 
-def duplicate_item(item_id):
+def cleanup_orphan_images():
+    """Delete images/<id>/ folders that no surviving item references.
+
+    Reference-aware rather than id-based: items copied before image files
+    were physically duplicated may still point into another item's folder,
+    and those folders must survive until the last referrer is gone.
+    Returns the number of folders removed.
+    """
+    if not IMAGES_DIR.exists():
+        return 0
+    conn = get_connection()
+    rows = conn.execute("SELECT images_json FROM items").fetchall()
+    conn.close()
+    referenced = set()
+    for r in rows:
+        try:
+            paths = json.loads(r["images_json"])
+        except Exception:
+            continue
+        for p in paths:
+            p = Path(p)
+            if p.is_absolute():
+                try:                       # legacy absolute path inside images/
+                    referenced.add(p.relative_to(IMAGES_DIR).parts[0])
+                except (ValueError, IndexError):
+                    pass
+            elif len(p.parts) >= 2 and p.parts[0] == "images":
+                referenced.add(p.parts[1])
+    removed = 0
+    for d in IMAGES_DIR.iterdir():
+        # Only touch the app's own numeric per-item folders, never anything else.
+        if d.is_dir() and d.name.isdigit() and d.name not in referenced:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def _copy_item_images(images, new_id):
+    """Copy an item's image files into images/<new_id>/ and return the
+    rewritten path list.  A file that can't be found or copied keeps its
+    original path, so the copy still displays whatever the original did."""
+    new_list = []
+    dest_dir = IMAGES_DIR / str(new_id)
+    for rel in images:
+        src = Path(rel)
+        if not src.is_absolute():
+            src = DATA_DIR / rel
+        try:
+            if src.exists():
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest = dest_dir / src.name
+                stem, suffix, n = src.stem, src.suffix, 1
+                while dest.exists():   # two sources sharing a filename
+                    dest = dest_dir / f"{stem}_{n}{suffix}"
+                    n += 1
+                shutil.copy2(src, dest)
+                new_list.append(f"images/{new_id}/{dest.name}")
+                continue
+        except OSError:
+            pass
+        new_list.append(rel)
+    return new_list
+
+
+def duplicate_item(item_id, collection_id=-2):
+    """Create a full copy of an item (fields, notes, images, tags).
+
+    Image files are physically copied into the new item's folder so the
+    copy owns its images — deleting the original can't orphan it.
+
+    *collection_id* follows the update_item convention: -2 (default) keeps
+    the original's collection, -1/None files the copy under no collection,
+    any other value places the copy in that collection.
+    """
     item = get_item(item_id)
     if not item:
         return None
-    return create_item(
+    if collection_id == -2:
+        target = item["collection_id"]
+    elif collection_id == -1 or collection_id is None:
+        target = None
+    else:
+        target = collection_id
+    new_id = create_item(
         item["type_id"],
         dict(item["fields"]),
-        item["collection_id"],
+        target,
         item["notes"],
-        list(item["images"]),
+        [],
     )
+    if new_id:
+        if item["images"]:
+            update_item(new_id, images=_copy_item_images(item["images"], new_id))
+        tags = [t["name"] for t in get_item_tags(item_id)]
+        if tags:
+            set_item_tags(new_id, tags)
+    return new_id
 
 
 def get_field_values(type_id, field_name, limit=100):
