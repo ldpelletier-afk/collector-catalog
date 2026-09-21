@@ -3984,6 +3984,7 @@ class CollectorCatalogApp:
         self._current_collection = -1
         self._current_tag = None
         self._search_query = ""
+        self._fullscreen_var = tk.BooleanVar(value=False)
 
         self._build_menu()
         self._build_toolbar()
@@ -3998,7 +3999,15 @@ class CollectorCatalogApp:
             self.root.bind(f"<{mod}-n>", lambda _e: self._new_item_here())
             self.root.bind(f"<{mod}-s>", lambda _e: self.detail.save_if_dirty())
             self.root.bind(f"<{mod}-f>", lambda _e: self._focus_search())
+
+        # Full screen: F11 everywhere, ⌃⌘F to match the macOS convention,
+        # and Escape to get back out without hunting for the menu.
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Control-Command-f>", self._toggle_fullscreen)
+        self.root.bind("<Escape>", self._exit_fullscreen)
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_quit)
+        self.root.after_idle(self._restore_fullscreen)
 
     def _on_callback_exception(self, exc_type, exc, tb):
         """Log UI callback errors and show them, instead of failing silently.
@@ -4058,6 +4067,11 @@ class CollectorCatalogApp:
         # View
         vm = tk.Menu(mb, tearoff=0)
         mb.add_cascade(label="View", menu=vm)
+        accel = "⌃⌘F" if sys.platform == "darwin" else "F11"
+        vm.add_checkbutton(label=f"Full Screen\t{accel}",
+                           variable=self._fullscreen_var,
+                           command=self._toggle_fullscreen)
+        vm.add_separator()
         self._theme_var = tk.StringVar(value=current_theme())
         vm.add_radiobutton(label="Light Mode", value="light",
                            variable=self._theme_var,
@@ -4799,6 +4813,59 @@ class CollectorCatalogApp:
     def on_quit(self):
         self.detail.save_if_dirty()
         self.root.destroy()
+
+    # ── Full screen ───────────────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self, _e=None):
+        """Flip full screen. Bound to the View menu, F11 / ⌃⌘F, and Escape."""
+        self._set_fullscreen(not self._is_fullscreen())
+        return "break"
+
+    def _exit_fullscreen(self, _e=None):
+        """Escape leaves full screen, and does nothing at all otherwise."""
+        if self._is_fullscreen():
+            self._set_fullscreen(False)
+            return "break"
+
+    def _is_fullscreen(self):
+        """What we last asked for — not what the window manager has done yet.
+
+        Reading ``-fullscreen`` back is unreliable: X11 window managers take
+        a beat to honour the request, so a quick second toggle would read the
+        stale value and flip the wrong way.
+        """
+        return bool(self._fullscreen_var.get())
+
+    def _set_fullscreen(self, on):
+        on = bool(on)
+        try:
+            self.root.attributes("-fullscreen", on)
+        except tk.TclError:
+            # A window manager without -fullscreen: maximize instead, so the
+            # menu item still does something recognisable.
+            try:
+                self.root.state("zoomed" if on else "normal")
+            except tk.TclError:
+                try:
+                    self.root.attributes("-zoomed", on)
+                except tk.TclError:
+                    return
+        self._fullscreen_var.set(on)
+        db.set_setting("fullscreen", on)
+        if on:
+            self._status_var.set("Full screen — press Esc to leave")
+        else:
+            # Put the item count back rather than leaving the hint behind.
+            n = len(self.item_list._items)
+            self._status_var.set(f"{n} item{'s' if n != 1 else ''}")
+        if not on:
+            # Re-assert the normal size; some WMs leave the window borderless.
+            self.root.after_idle(lambda: self.root.geometry("1200x740"))
+
+    def _restore_fullscreen(self):
+        """Re-enter full screen at launch if that's how the app was left."""
+        if db.get_setting("fullscreen", False):
+            self._set_fullscreen(True)
 
     def _set_theme(self, name):
         """Persist the chosen color theme. Palette colors are captured when
