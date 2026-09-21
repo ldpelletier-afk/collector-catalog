@@ -9,6 +9,7 @@ BUILTIN_TYPES = [
             {"name": "title",     "label": "Title",       "type": "text",      "required": True,  "is_title": True},
             {"name": "author",    "label": "Author",      "type": "text",      "required": True,  "is_creator": True},
             {"name": "translator","label": "Translator",  "type": "text"},
+            {"name": "editor",    "label": "Editor",      "type": "text"},
             {"name": "year",      "label": "Year",        "type": "text",      "is_year": True},
             {"name": "publisher", "label": "Publisher",   "type": "text"},
             {"name": "address",   "label": "Place",       "type": "text"},

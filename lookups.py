@@ -97,16 +97,18 @@ def lookup_isbn(isbn: str, try_penguin: bool = True) -> Dict[str, str]:
         if authors:
             out["author"] = " and ".join(a.get("name", "") for a in authors if a.get("name"))
 
-        # Open Library keeps translators (and editors, illustrators…) in a
+        # Open Library keeps translators and editors (and illustrators…) in a
         # separate contributors list — worth picking up for a shelf of
-        # classics, where which translation you own is half the point.
-        translators = [
-            c.get("name", "").strip()
-            for c in (rec.get("contributors") or [])
-            if "translat" in str(c.get("role") or "").lower() and c.get("name")
-        ]
-        if translators:
-            out["translator"] = " and ".join(translators)
+        # classics and anthologies, where which translation or edition you
+        # own is half the point.
+        for field, role_match in (("translator", "translat"), ("editor", "editor")):
+            names = [
+                c.get("name", "").strip()
+                for c in (rec.get("contributors") or [])
+                if role_match in str(c.get("role") or "").lower() and c.get("name")
+            ]
+            if names:
+                out[field] = " and ".join(names)
 
         publishers = rec.get("publishers") or []
         if publishers:
