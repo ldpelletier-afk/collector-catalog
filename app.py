@@ -1023,16 +1023,27 @@ class DetailPanel(tk.Frame):
         self._header.pack(fill="x")
         tk.Frame(self._header, bg=C["border"], height=1).pack(fill="x", side="bottom")
 
+        # The type and cite key live in a box of fixed width that clips its
+        # contents.  Pack doesn't shrink labels, so without this a long cite
+        # key pushes the header buttons off the right-hand edge and they
+        # draw on top of each other.  The full key stays readable in the
+        # Cite Key field on the Info tab.
+        self._key_box = tk.Frame(self._header, bg=C["toolbar"],
+                                 width=150, height=24)
+        self._key_box.pack(side="left", padx=(12, 6), pady=4)
+        self._key_box.pack_propagate(False)
+
         self._lbl_type = tk.Label(
-            self._header, text="", bg=C["toolbar"], fg=C["subtext"], font=_font(10),
+            self._key_box, text="", bg=C["toolbar"], fg=C["subtext"],
+            font=_font(10),
         )
-        self._lbl_type.pack(side="left", padx=(12, 4), pady=6)
+        self._lbl_type.pack(side="left")
 
         self._lbl_key = tk.Label(
-            self._header, text="", bg=C["toolbar"], fg=C["text"],
-            font=_font(10, mono=True),
+            self._key_box, text="", bg=C["toolbar"], fg=C["text"],
+            font=_font(10, mono=True), anchor="w",
         )
-        self._lbl_key.pack(side="left", padx=0, pady=6)
+        self._lbl_key.pack(side="left", padx=(4, 0))
 
         self._btn_save = FlatButton(
             self._header, "Save Changes", command=self._save, kind="primary",
@@ -3963,6 +3974,7 @@ class CollectorCatalogApp:
         self.root = root
         self.root.title("Collector Catalog")
         self.root.geometry("1200x740")
+        self.root.minsize(880, 560)   # below this the three panels can't coexist
         self.root.configure(bg=C["main"])
         if sys.platform == "darwin":
             self.root.createcommand("tk::mac::Quit", self.on_quit)
@@ -4137,9 +4149,16 @@ class CollectorCatalogApp:
         self._search_entry.bind("<FocusOut>", self._search_focus_out)
         self._search_entry.bind("<Escape>",   self._search_clear)
 
+    # Smallest item list worth showing, and the widths the other two panels
+    # are trimmed back to when the window can't fit everything at once.
+    MIN_LIST_W    = 260
+    PREF_SIDEBAR_W = 240
+    PREF_DETAIL_W  = 600
+
     def _build_main(self):
         pane = ttk.PanedWindow(self.root, orient="horizontal")
         pane.pack(fill="both", expand=True)
+        self._pane = pane
 
         self.sidebar = Sidebar(pane, self, width=220)
         self.item_list = ItemList(pane, self, width=480)
@@ -4148,6 +4167,52 @@ class CollectorCatalogApp:
         pane.add(self.sidebar,   weight=0)
         pane.add(self.item_list, weight=1)
         pane.add(self.detail,    weight=0)
+
+        # The three panels ask for more width than the window has, and ttk
+        # takes the shortfall out of the flexible pane — which squeezes the
+        # item list down to a pixel or two.  Place the sashes ourselves once
+        # the window has a real size, and again whenever it is resized
+        # (leaving full screen shrinks it back down).
+        self.root.after_idle(self._keep_panes_usable)
+        self.root.bind("<Configure>", self._on_root_configure)
+
+    def _on_root_configure(self, e):
+        """Re-check the split after a resize, coalescing the event storm."""
+        if e.widget is not self.root:
+            return
+        if getattr(self, "_pane_after", None):
+            try:
+                self.root.after_cancel(self._pane_after)
+            except Exception:  # noqa: BLE001
+                pass
+        self._pane_after = self.root.after(120, self._keep_panes_usable)
+
+    def _keep_panes_usable(self):
+        """Give the item list a usable width if it has been squeezed out.
+
+        Only steps in when the list is too narrow to read, so a split the
+        user has dragged to their own taste is left alone.
+        """
+        self._pane_after = None
+        pane = getattr(self, "_pane", None)
+        if pane is None:
+            return
+        total = pane.winfo_width()
+        if total <= 1:                      # not mapped yet
+            self.root.after(50, self._keep_panes_usable)
+            return
+        if self.item_list.winfo_width() >= self.MIN_LIST_W:
+            return
+
+        sidebar_w = min(self.PREF_SIDEBAR_W, max(160, total // 5))
+        list_w = max(self.MIN_LIST_W, total - sidebar_w - self.PREF_DETAIL_W)
+        if sidebar_w + list_w > total - 240:     # very narrow window: the
+            list_w = max(160, total - sidebar_w - 240)   # detail panel yields
+        try:
+            pane.sashpos(0, sidebar_w)
+            pane.sashpos(1, sidebar_w + list_w)
+        except tk.TclError:
+            pass
 
     def _build_status(self):
         self._status_var = tk.StringVar(value="Ready")
